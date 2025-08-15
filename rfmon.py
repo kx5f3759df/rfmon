@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+band_sentry_dual_duty.py — Wideband NFM activity scanner/logger for RTL-SDR
+(Outputs two duty metrics: single-bin 'duty' and legacy cluster-based 'duty_wide')
+
+Based on your original band_sentry.py with minimal, additive changes:
+- Adds Track.active_center_s to accumulate single-bin activity time per frame.
+- Keeps original active_s accumulation (now reported as duty_wide).
+- Appends a second per-frame loop to count center-bin-only duty without touching the original loop.
+- CSV & console now print both duty (single-bin) and duty_wide (legacy cluster/merged).
+
+Deps: pyrtlsdr, numpy, scipy
+"""
+
+import argparse, math, time, sys, csv, signal, datetime, os
+import numpy as np
+from rtlsdr import RtlSdr
+from scipy.signal import get_window
+
+# --------------------------- Utils ---------------------------
+
+def iso_utc(ts=None):
+    if ts is None:
+        ts = time.time()
+    return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def db10(x):
+    return 10.0 * np.log10(np.maximum(x, 1e-20))
+
+def median_noise_db(p_db, exclude_mid=0):
+    """Median noise estimate; optionally exclude ±exclude_mid bins around DC."""
+    if exclude_mid and exclude_mid > 0:
+        n = p_db.size
+        m = n // 2
+        mask = np.ones(n, dtype=bool)
+        lo = max(0, m - exclude_mid)
+        hi = min(n, m + exclude_mid + 1)
+        mask[lo:hi] = False
+        vals = p_db[mask]
+        if vals.size:
+            return np.median(vals)
+    return np.median(p_db)
+
+def clusters_from_mask(mask):
+    """Return list of (start_idx, end_idx) inclusive for contiguous True segments."""
+    clusters = []
+    n = len(mask)
+    i = 0
+    while i < n:
+        if mask[i]:
+            j = i
+            while j + 1 < n and mask[j + 1]:
+                j += 1
+            clusters.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return clusters
+
+# --------------------------- Tracking ---------------------------
+
+class Track:
+    __slots__ = ("f_hz", "active_s", "active_center_s", "max_db", "last_seen", "sum_wf", "sum_w")
+    def __init__(self, f_hz, p_db, now):
+        self.f_hz = float(f_hz)
+        self.active_s = 0.0           # legacy (cluster/merge) activity time
+        self.active_center_s = 0.0    # single-bin activity time
+        self.max_db = float(p_db)
+        self.last_seen = now
+        self.sum_wf = 0.0  # freq centroid accumulator
+        self.sum_w = 0.0
+
+    def update_centroid(self, f_center_hz, weight=1.0):
+        self.sum_wf += float(f_center_hz) * float(weight)
+        self.sum_w  += float(weight)
+        if self.sum_w > 0:
+            self.f_hz = self.sum_wf / self.sum_w
+
+# --------------------------- Core ---------------------------
+
+def run(args):
+    # Prepare CSV file (append, named by start UTC)
+    start_iso = iso_utc()
+    csv_name = f"scan_{start_iso.replace(':','-')}.csv"
+    csv_f = open(csv_name, "a", newline="")
+    csv_w = csv.writer(csv_f)
+    if csv_f.tell() == 0:
+        # Columns: original + duty (single-bin) + duty_wide (legacy)
+        csv_w.writerow(["utc_iso", "center_mhz", "p_dbfs", "duty", "duty_wide"])
+    print(f"[i] CSV -> {csv_name}")
+
+    # RTL-SDR setup (no 0 Hz tuning!)
+    sdr = RtlSdr()
+    samp_hz = int(args.samp * 1e6)
+    sdr.sample_rate = samp_hz
+
+    # Only set PPM if non-zero to avoid buggy drivers complaining about "0 ppm"
+    if int(args.ppm) != 0:
+        try:
+            sdr.freq_correction = int(args.ppm)
+        except Exception as e:
+            print(f"[w] set ppm failed ({e}); continuing without correction", file=sys.stderr)
+
+    # Gain
+    sdr.gain = args.gain if args.gain == "auto" else float(args.gain)
+
+    # FFT params: choose nfft so that bin ~ 500 Hz (cap at 65536 for speed)
+    target_bin_hz = 500.0
+    nfft = 1
+    while (samp_hz / nfft) > target_bin_hz:
+        nfft *= 2
+        if nfft >= 65536:
+            nfft = 65536
+            break
+    frame = nfft
+    hop = nfft  # no overlap for speed
+    win = get_window("hann", nfft, fftbins=True).astype(np.float32)
+    win_pow = float((win ** 2).sum())
+
+    # Detection settings
+    detect_bw_hz = float(args.nbw) * 1e3                  # e.g. 12.5 kHz
+    merge_tol_hz = max(6000.0, detect_bw_hz * 0.5)        # cluster merge tolerance
+    dc_bins_exclude = int(max(1, args.dc_khz * 1000.0 / (samp_hz / nfft))) if args.dc_suppress else 0
+    dutyth = 0.20                                         # fixed 20% rule
+    dwell_s = float(args.dwell)
+    bin_hz = samp_hz / nfft
+
+    # Scan stepping
+    step_mhz = args.samp * (1.0 - args.overlap / 100.0)
+    if step_mhz <= 0.0:
+        step_mhz = args.samp
+
+    print(f"[i] samp={args.samp:.3f} MHz, exact bin≈{bin_hz:.1f} Hz, nfft={nfft}, dwell={dwell_s:.2f}s")
+    print(f"[i] scan {args.f_start:.3f}–{args.f_stop:.3f} MHz, step≈{step_mhz:.3f} MHz (overlap={args.overlap}%)")
+    print(f"[i] detect BW≈{args.nbw:.2f} kHz, merge_tol≈{merge_tol_hz/1e3:.1f} kHz, DC suppress={args.dc_suppress} (±{args.dc_khz:.1f} kHz)")
+    if args.auto_threshold is not None:
+        print(f"[i] threshold: noise +{args.auto_threshold:.1f} dB")
+    else:
+        print(f"[i] threshold: absolute {args.abs_threshold:.1f} dBFS")
+
+    # Signal handling
+    stop_flag = False
+    def on_stop(sig, frm):
+        nonlocal stop_flag
+        stop_flag = True
+    signal.signal(signal.SIGINT, on_stop)
+    signal.signal(signal.SIGTERM, on_stop)
+
+    # Tuning helper with tiny offsets to coax the PLL if needed
+    def tune_with_retry(hz):
+        offsets = [0, +1000, -1000, +2000, -2000]  # Hz
+        last_err = None
+        for off in offsets:
+            try:
+                sdr.center_freq = float(hz + off)
+                time.sleep(0.01)  # small settle
+                return True
+            except Exception as e:
+                last_err = e
+        if last_err:
+            print(f"[!] tune failed @ {hz/1e6:.6f} MHz: {last_err}", file=sys.stderr)
+        return False
+
+    # Main scan loop
+    win_start_mhz = args.f_start
+    while not stop_flag:
+        win_stop_mhz = min(args.f_stop, win_start_mhz + args.samp)
+        if win_stop_mhz <= win_start_mhz:
+            # wrap to start
+            win_start_mhz = args.f_start
+            continue
+
+        center_mhz = 0.5 * (win_start_mhz + win_stop_mhz)
+        want_hz = center_mhz * 1e6
+        if not tune_with_retry(want_hz):
+            # Skip this window on failure
+            win_start_mhz = args.f_start if (win_start_mhz + step_mhz) >= args.f_stop else (win_start_mhz + step_mhz)
+            continue
+
+        t0 = time.time()
+        tracks = []
+        fr_dur = frame / float(samp_hz)
+
+        while not stop_flag and (time.time() - t0) < dwell_s:
+            # One FFT frame
+            iq = sdr.read_samples(frame).astype(np.complex64)
+            sp = np.fft.fftshift(np.fft.fft(iq * win, n=nfft))
+            p_lin = (np.abs(sp) ** 2) / win_pow / nfft
+            p_db = db10(p_lin)
+
+            # DC suppression
+            if dc_bins_exclude > 0:
+                mid = nfft // 2
+                lo = max(0, mid - dc_bins_exclude)
+                hi = min(nfft, mid + dc_bins_exclude + 1)
+                p_db[lo:hi] = -300.0
+
+            # Threshold
+            if args.auto_threshold is not None:
+                noise_db = median_noise_db(p_db, exclude_mid=dc_bins_exclude + 3)
+                thr_db = float(noise_db + args.auto_threshold)
+            else:
+                thr_db = float(args.abs_threshold)
+
+            mask = (p_db >= thr_db)
+            clusters = clusters_from_mask(mask)
+
+            now = time.time()
+
+            # -------- Original cluster/merge loop (kept intact) --------
+            for (i0, i1) in clusters:
+                idx = np.arange(i0, i1 + 1)
+                slin = p_lin[i0:i1 + 1]
+                if slin.size == 0 or slin.sum() <= 0:
+                    continue
+
+                # Bin -> frequency offset (FFT is fftshifted)
+                f_off = (idx - (nfft // 2)) * bin_hz
+                # Power-weighted centroid
+                f_center_hz = float((f_off * slin).sum() / slin.sum())
+                abs_freq_hz = want_hz + f_center_hz
+
+                # Mean power for this cluster
+                p_db_mean = float(db10(slin.mean()))
+
+                # Merge into tracks by frequency proximity
+                merged = False
+                for tr in tracks:
+                    if abs(tr.f_hz - abs_freq_hz) <= merge_tol_hz:
+                        tr.active_s += fr_dur
+                        if p_db_mean > tr.max_db:
+                            tr.max_db = p_db_mean
+                        tr.update_centroid(abs_freq_hz, weight=float(slin.sum()))
+                        tr.last_seen = now
+                        merged = True
+                        break
+                if not merged:
+                    tr = Track(abs_freq_hz, p_db_mean, now)
+                    tr.active_s += fr_dur
+                    tr.update_centroid(abs_freq_hz, weight=float(slin.sum()))
+                    tracks.append(tr)
+            # -------- End original loop --------
+
+            # -------- New: single-bin (center-bin) duty accumulation --------
+            # To avoid double-counting same track multiple clusters in one frame,
+            # record which tracks we've already incremented this frame.
+            incremented_ids = set()
+
+            for (i0, i1) in clusters:
+                mid_bin = (i0 + i1) // 2
+                # Sanity check on index
+                if mid_bin < 0 or mid_bin >= nfft:
+                    continue
+                # If the center bin is above threshold, count this frame for single-bin duty
+                if p_db[mid_bin] >= thr_db:
+                    # Convert mid_bin to absolute frequency
+                    f_off_mid = (mid_bin - (nfft // 2)) * bin_hz
+                    abs_freq_hz_mid = want_hz + f_off_mid
+
+                    # Find the nearest track (created by the original loop) within merge tolerance
+                    best_tr = None
+                    best_df = None
+                    for tr in tracks:
+                        df = abs(tr.f_hz - abs_freq_hz_mid)
+                        if df <= merge_tol_hz and (best_df is None or df < best_df):
+                            best_df = df
+                            best_tr = tr
+
+                    if best_tr is not None:
+                        # Ensure only once per frame per track
+                        if id(best_tr) not in incremented_ids:
+                            best_tr.active_center_s += fr_dur
+                            incremented_ids.add(id(best_tr))
+                    else:
+                        # If for some reason no track exists (extremely rare, since clusters created above),
+                        # create a minimal track so that duty counting is not lost.
+                        tr_new = Track(abs_freq_hz_mid, float(p_db[mid_bin]), now)
+                        tr_new.active_center_s += fr_dur
+                        tr_new.active_s += 0.0  # keep legacy untouched here
+                        tracks.append(tr_new)
+            # -------- End new loop --------
+
+        # Emit hits
+        for tr in tracks:
+            # Clip to [0, 1] to avoid >100% due to edge cases
+            duty_center = tr.active_center_s / dwell_s if dwell_s > 0 else 0.0
+            duty_wide   = tr.active_s         / dwell_s if dwell_s > 0 else 0.0
+
+            if duty_wide >= dutyth or duty_center >= dutyth:
+                utc = iso_utc()
+                center_mhz_out = tr.f_hz / 1e6
+                row = [
+                    utc,
+                    f"{center_mhz_out:.6f}",
+                    f"{tr.max_db:.2f}",
+                    f"{duty_center*100:.1f}",  # duty (single-bin)
+                    f"{duty_wide*100:.1f}",    # duty_wide (legacy)
+                ]
+                csv_w.writerow(row); csv_f.flush()
+                print(
+                    f"[HIT] {utc}  {center_mhz_out:.6f} MHz  {tr.max_db:.2f} dBFS  "
+                    f"duty={duty_center*100:.1f}%  duty_wide={duty_wide*100:.1f}%"
+                )
+                sys.stdout.flush()
+
+        # Advance window
+        next_start = win_start_mhz + step_mhz
+        win_start_mhz = args.f_start if next_start >= args.f_stop else next_start
+
+    # Cleanup
+    try:
+        sdr.close()
+    except Exception:
+        pass
+    csv_f.close()
+    print("[i] exit.")
+
+# --------------------------- CLI ---------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Wideband NFM activity scanner/logger for RTL-SDR (dual duty outputs)")
+    p.add_argument("--f-start", type=float, default=440.0, help="Start frequency (MHz)")
+    p.add_argument("--f-stop",  type=float, default=450.0, help="Stop  frequency (MHz)")
+    p.add_argument("--samp",    type=float, default=2.0,   help="Sample rate / span (MHz), e.g., 2.0~2.4")
+    p.add_argument("--dwell",   type=int,   default=5,     help="Dwell time per window (s)")
+    p.add_argument("--gain",    default="20",              help="Gain dB (float) or 'auto' (default 20)")
+    p.add_argument("--overlap", type=int,   default=10,    help="Window overlap percent (0-90)")
+    p.add_argument("--ppm",     type=int,   default=0,     help="Frequency correction (ppm), default 0")
+
+    # Threshold modes (mutually exclusive)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--auto-threshold", type=float, help="Use noise floor +X dB")
+    g.add_argument("--abs-threshold",  type=float, help="Use absolute threshold X dBFS")
+
+    p.add_argument("--nbw", type=float, default=12.5, help="NFM detection bandwidth (kHz), default 12.5")
+    # DC suppression default ON; allow disabling with --no-dc-suppress
+    p.add_argument("--dc-suppress", action="store_true", default=True, help="Suppress DC at center (default ON)")
+    p.add_argument("--no-dc-suppress", dest="dc_suppress", action="store_false")
+    p.add_argument("--dc-khz", type=float, default=2.0, help="DC suppression half-width (kHz), default 2")
+
+    args = p.parse_args()
+    if args.f_stop <= args.f_start:
+        print("[!] f-stop must be > f-start", file=sys.stderr); sys.exit(1)
+    if args.overlap < 0 or args.overlap >= 100:
+        print("[!] overlap must be in [0, 99]", file=sys.stderr); sys.exit(1)
+    return args
+
+if __name__ == "__main__":
+    try:
+        run(parse_args())
+    except Exception as e:
+        print(f"[!] fatal: {e}", file=sys.stderr)
+        sys.exit(2)
