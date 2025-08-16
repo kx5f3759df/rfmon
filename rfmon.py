@@ -17,8 +17,37 @@ import argparse, math, time, sys, csv, signal, datetime, os
 import numpy as np
 from rtlsdr import RtlSdr
 from scipy.signal import get_window
+import random
 
 # --------------------------- Utils ---------------------------
+
+def aggregate_to_center(values, tolerance=0.5):
+    if not values:
+        return []
+    
+    values = sorted(values)
+    groups = []
+    current_group = [values[0]]
+
+    for val in values[1:]:
+        if abs(val - current_group[-1]) <= tolerance:
+            current_group.append(val)
+        else:
+            groups.append(current_group)
+            current_group = [val]
+    groups.append(current_group)
+
+    centers = [round(sum(group) / len(group), 3) for group in groups]
+    return centers
+
+def double_peak_sample(a=0.0, b=1.0, sigma=0.15, mix=0.5):
+    if random.random() < mix:  
+        val = random.random()
+    elif random.random() < 0.5:
+        val = min(max(random.gauss(0.25, sigma), 0), 1)
+    else:
+        val = min(max(random.gauss(0.75, sigma), 0), 1)
+    return a + val * (b - a)
 
 def iso_utc(ts=None):
     if ts is None:
@@ -139,6 +168,16 @@ def run(args):
     else:
         print(f"[i] threshold: absolute {args.abs_threshold:.1f} dBFS")
 
+    # Generate center freq list
+    centers_template = []
+    ws = args.f_start
+    while ws < args.f_stop:
+        we = min(args.f_stop, ws + args.samp)
+        if we <= ws:
+            break
+        centers_template.append(0.5 * (ws + we))
+        ws += step_mhz
+
     # Signal handling
     stop_flag = False
     def on_stop(sig, frm):
@@ -163,19 +202,39 @@ def run(args):
         return False
 
     # Main scan loop
-    win_start_mhz = args.f_start
-    while not stop_flag:
-        win_stop_mhz = min(args.f_stop, win_start_mhz + args.samp)
-        if win_stop_mhz <= win_start_mhz:
-            # wrap to start
-            win_start_mhz = args.f_start
-            continue
+    # win_start_mhz = args.f_start
+    # while not stop_flag:
+    #     win_stop_mhz = min(args.f_stop, win_start_mhz + args.samp)
+    #     if win_stop_mhz <= win_start_mhz:
+    #         # wrap to start
+    #         win_start_mhz = args.f_start
+    #         continue
+    # 
+    #     center_mhz = 0.5 * (win_start_mhz + win_stop_mhz)
+    #     want_hz = center_mhz * 1e6
+    #     if not tune_with_retry(want_hz):
+    #         # Skip this window on failure
+    #         win_start_mhz = args.f_start if (win_start_mhz + step_mhz) >= args.f_stop else (win_start_mhz + step_mhz)
+    #         continue
+    
+    centers = []
+    hits = []
 
-        center_mhz = 0.5 * (win_start_mhz + win_stop_mhz)
+    while not stop_flag:
+        if not centers:
+            # wrap to start
+            centers = centers_template.copy() + aggregate_to_center(hits).copy()
+            # Add small random ±5 kHz dither to centers to avoid DC-bin suppression artifacts
+            centers = list(map(lambda f: f + double_peak_sample(-0.005, 0.005), centers))
+
+            random.shuffle(centers)
+
+            hits = hits[-1000:]
+
+        center_mhz = centers.pop(0)
         want_hz = center_mhz * 1e6
         if not tune_with_retry(want_hz):
             # Skip this window on failure
-            win_start_mhz = args.f_start if (win_start_mhz + step_mhz) >= args.f_stop else (win_start_mhz + step_mhz)
             continue
 
         t0 = time.time()
@@ -290,6 +349,9 @@ def run(args):
             if duty_wide >= dutyth or duty_center >= dutyth:
                 utc = iso_utc()
                 center_mhz_out = tr.f_hz / 1e6
+                if round(center_mhz_out, 3) in hits:
+                    hits.remove(round(center_mhz_out, 3))
+                hits.append(round(center_mhz_out, 3))
                 row = [
                     utc,
                     f"{center_mhz_out:.6f}",
@@ -305,8 +367,8 @@ def run(args):
                 sys.stdout.flush()
 
         # Advance window
-        next_start = win_start_mhz + step_mhz
-        win_start_mhz = args.f_start if next_start >= args.f_stop else next_start
+        # next_start = win_start_mhz + step_mhz
+        # win_start_mhz = args.f_start if next_start >= args.f_stop else next_start
 
     # Cleanup
     try:
@@ -323,7 +385,7 @@ def parse_args():
     p.add_argument("--f-start", type=float, default=440.0, help="Start frequency (MHz)")
     p.add_argument("--f-stop",  type=float, default=450.0, help="Stop  frequency (MHz)")
     p.add_argument("--samp",    type=float, default=2.0,   help="Sample rate / span (MHz), e.g., 2.0~2.4")
-    p.add_argument("--dwell",   type=int,   default=5,     help="Dwell time per window (s)")
+    p.add_argument("--dwell",   type=float, default=5.0,     help="Dwell time per window (s)")
     p.add_argument("--gain",    default="20",              help="Gain dB (float) or 'auto' (default 20)")
     p.add_argument("--overlap", type=int,   default=10,    help="Window overlap percent (0-90)")
     p.add_argument("--ppm",     type=int,   default=0,     help="Frequency correction (ppm), default 0")
