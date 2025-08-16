@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-aggr.py — Aggregate RF scan CSVs into continuous segments using temporal tracking,
-with strict guarantees and robust frequency stabilization:
+aggr.py — RF aggregation for sliding-window scans (non-uniform coverage).
 
-- Same FFT frame (same UTC) observations are NEVER merged.
-- Temporal tracking across frames (greedy 1-1 with hysteresis and miss tolerance).
-- Segmenting by time gap (default 10 minutes).
-- Two-stage stabilization (NO rounding until the very end):
-  1) Per-track canonical snapping (align segments back to each track canonical).
-  2) Global-mode snapping built from a smoothed histogram of segment frequencies,
-     with STRICT adjacent-peak merging: peaks within <= 1 bin are fused into a
-     single mode (weighted centroid), to collapse 1 kHz bucket splits like
-     449.996 / 449.997 into ONE final label when they truly represent one source.
+Key properties:
+- Does NOT assume every scan covers the full band or that frames are regular.
+- Builds a time–frequency connectivity graph across ALL observations:
+  • Two points link if their time gap ≤ link_time_max AND their frequency
+    difference ≤ link_freq_base_mhz + link_freq_per_sec_mhz * Δt_seconds.
+  • Points with the SAME UTC timestamp (same FFT) are NEVER linked.
+- Connected components are interpreted as "sources" (tracks). Within each
+  component, observations are ordered by time and cut into segments where the
+  time gap exceeds max_gap_min.
+- Optional component-level canonical snapping stabilizes segment centers.
+- Global frequency clustering uses 1D complete-link with a PHYSICAL tolerance
+  (MHz), independent of any histogram/bin grid. This guarantees that very close
+  centers (e.g., 449.9969 & 449.9973) merge whenever fuse_tol_mhz ≥ 0.0004.
+- FINAL rounding only at export using Decimal half-up respecting --round_freq.
 
-Final CSV columns:
+Output CSV columns:
   start_utc, end_utc, freq, samples, pwr_avg, pwr_sd, duty_avg, duty_sd
 """
 
@@ -24,48 +28,20 @@ import argparse
 import json
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 
 
 # -------------------------
-# Defaults (conservative & data-driven)
-# -------------------------
-FREQ_TOL = 0.0012           # MHz, base tolerance for frame-to-frame matching
-FREQ_TOL_PER_SEC = 0.0      # MHz/s, extra tolerance per second (if needed)
-CONTINUE_TOL_MULT = 1.6     # continuation hysteresis multiplier
-ROUND_FREQ = 0.001          # MHz, rounding step (APPLIED ONLY AT FINAL EXPORT)
-MAX_GAP = timedelta(minutes=10)  # >10 minutes -> discontinuity (new segment)
-MAX_MISSES = 2              # allow this many consecutive misses
-MIN_SEG_SAMPLES = 1         # minimum samples per segment to keep
-MIN_CONFIRM_SAMPLES = 2     # track becomes confirmed after this many points
-VEL_ALPHA = 0.5             # EMA factor for df/dt
-
-# Stage-1: per-track canonical snapping (no rounding)
-SNAP_TO_TRACK_CANONICAL = True
-SNAP_TOL_MHZ = 0.0015       # if segment mean within this of canonical -> snap
-CANON_USE_FIRST_N = 5       # canonical = median of first N obs
-
-# Stage-2: global-mode snapping (no rounding)
-GLOBAL_SNAP_TO_MODES = True
-GLOBAL_BIN_STEP = 0.001     # MHz (match final rounding step)
-GLOBAL_SNAP_TOL_MHZ = 0.0015  # MHz, tolerance to snap to nearest global mode
-GLOBAL_MODE_MIN_SEG = 1     # min segments in a bin to consider for peaks
-GLOBAL_PEAK_WINDOW = 1      # +/- bins around a peak for weighted centroid
-# STRICT: merge any two peaks whose centers differ by <= 1 bin
-GLOBAL_STRICT_MERGE_BINS = 1
-
-
-# -------------------------
 # Utilities
 # -------------------------
 def parse_utc(s: str) -> datetime:
-    """Parse a UTC timestamp string into a timezone-aware datetime in UTC."""
-    s = s.strip()
+    """Parse various UTC string formats to a timezone-aware UTC datetime."""
+    s = str(s).strip()
     fmts = [
         "%Y-%m-%dT%H:%M:%SZ",
         "%Y-%m-%d %H:%M:%S",
@@ -86,20 +62,44 @@ def parse_utc(s: str) -> datetime:
 
 
 def round_to_step(x: float, step: float) -> float:
-    """Round to nearest step; keep 3 decimals for MHz at kHz step."""
-    return round(round(x / step) * step, 3)
+    """Round x to nearest multiple of 'step' using Decimal half-up; preserve step decimals."""
+    from decimal import Decimal, ROUND_HALF_UP, getcontext
+    getcontext().prec = 20
+    d = Decimal(str(x))
+    s = Decimal(str(step))
+    q = (d / s).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * s
+    decimals = max(0, -s.as_tuple().exponent)
+    quant = Decimal('1').scaleb(-decimals)
+    q = q.quantize(quant, rounding=ROUND_HALF_UP)
+    return float(q)
 
 
-def nanmean(a: List[float]) -> float:
-    return float(np.nanmean(a)) if len(a) else float("nan")
+def nanmean(a) -> float:
+    arr = np.asarray(a, dtype=float)
+    return float(np.nanmean(arr)) if arr.size else float("nan")
 
 
-def nansd(a: List[float]) -> float:
-    return float(np.nanstd(a, ddof=0)) if len(a) else float("nan")
+def nansd(a) -> float:
+    arr = np.asarray(a, dtype=float)
+    return float(np.nanstd(arr, ddof=0)) if arr.size else float("nan")
+
+
+def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Weighted median for stable cluster centers."""
+    if len(values) == 0:
+        return float("nan")
+    order = np.argsort(values)
+    v = values[order]
+    w = weights[order]
+    cum = np.cumsum(w)
+    cutoff = 0.5 * np.sum(w)
+    idx = np.searchsorted(cum, cutoff)
+    idx = min(idx, len(v) - 1)
+    return float(v[idx])
 
 
 # -------------------------
-# Data loading
+# Data loading / normalization
 # -------------------------
 def load_rows_from_csv(path: str) -> pd.DataFrame:
     """Normalize CSV to columns: utc, freq_mhz, p_dbfs, duty."""
@@ -179,375 +179,279 @@ def load_all_rows(directory: str) -> pd.DataFrame:
 
 
 # -------------------------
-# Tracking across frames
+# Connectivity graph (DSU in sorted-time space)
 # -------------------------
-@dataclass
-class Obs:
-    utc: datetime
-    freq_mhz: float
-    p_dbfs: float
-    duty: float
+class DSU:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
 
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
 
-@dataclass
-class Track:
-    """A track is a time-ordered sequence of observations belonging to one signal."""
-    last_freq: float
-    last_utc: datetime
-    last_p: float
-    last_duty: float
-    points: List[Obs] = field(default_factory=list)
-    misses: int = 0
-    v_mhz_per_s: float = 0.0
-    confirmed: bool = False
-
-    def predict(self, utc: datetime) -> float:
-        dt = (utc - self.last_utc).total_seconds()
-        if dt <= 0:
-            return self.last_freq
-        return self.last_freq + self.v_mhz_per_s * dt
-
-    def add(self, o: Obs) -> None:
-        if self.points:
-            dt = max(1e-9, (o.utc - self.last_utc).total_seconds())
-            inst_v = (o.freq_mhz - self.last_freq) / dt
-            self.v_mhz_per_s = (1 - VEL_ALPHA) * self.v_mhz_per_s + VEL_ALPHA * inst_v
-        self.points.append(o)
-        self.last_freq = o.freq_mhz
-        self.last_utc = o.utc
-        self.last_p = o.p_dbfs
-        self.last_duty = o.duty
-        self.misses = 0
-        if not self.confirmed and len(self.points) >= MIN_CONFIRM_SAMPLES:
-            self.confirmed = True
-
-
-def _frame_groups(df: pd.DataFrame) -> List[Tuple[datetime, pd.DataFrame]]:
-    frames: List[Tuple[datetime, pd.DataFrame]] = []
-    for utc_val, g in df.groupby("utc", sort=True):
-        g = g.sort_values("freq_mhz").reset_index(drop=True)
-        frames.append((utc_val, g))
-    return frames
-
-
-def _match_frame_greedy(tracks: List[Track], obs_list: List[Obs], utc_now: datetime) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
-    """Greedy one-to-one matching with hysteresis and prediction."""
-    if not tracks or not obs_list:
-        return [], list(range(len(tracks))), list(range(len(obs_list)))
-
-    pairs: List[Tuple[float, int, int]] = []
-    for ti, tr in enumerate(tracks):
-        f_pred = tr.predict(utc_now)
-        dt = max(0.0, (utc_now - tr.last_utc).total_seconds())
-        base_tol = FREQ_TOL + FREQ_TOL_PER_SEC * dt
-        tol = base_tol * CONTINUE_TOL_MULT
-        for oi, ob in enumerate(obs_list):
-            dfreq = abs(ob.freq_mhz - f_pred)
-            if dfreq <= tol:
-                p_term = 0.05 * abs(ob.p_dbfs - tr.last_p) if not math.isnan(ob.p_dbfs) and not math.isnan(tr.last_p) else 0.0
-                cost = dfreq + p_term
-                pairs.append((cost, ti, oi))
-
-    pairs.sort(key=lambda x: x[0])
-    matched_t = set()
-    matched_o = set()
-    matches: List[Tuple[int, int]] = []
-    for _, ti, oi in pairs:
-        if ti in matched_t or oi in matched_o:
-            continue
-        matched_t.add(ti)
-        matched_o.add(oi)
-        matches.append((ti, oi))
-
-    unmatched_t = [i for i in range(len(tracks)) if i not in matched_t]
-    unmatched_o = [i for i in range(len(obs_list)) if i not in matched_o]
-    return matches, unmatched_t, unmatched_o
-
-
-def track_frequencies_by_frame(df: pd.DataFrame) -> List[Track]:
-    frames = _frame_groups(df)
-    active: List[Track] = []
-    finished: List[Track] = []
-
-    for utc_now, g in frames:
-        obs_list = [Obs(utc=row.utc, freq_mhz=float(row.freq_mhz), p_dbfs=float(row.p_dbfs), duty=float(row.duty) if not pd.isna(row.duty) else float("nan"))
-                    for _, row in g.iterrows()]
-
-        matches, unmatched_t, unmatched_o = _match_frame_greedy(active, obs_list, utc_now)
-
-        for ti, oi in matches:
-            active[ti].add(obs_list[oi])
-        for ti in unmatched_t:
-            active[ti].misses += 1
-        for oi in unmatched_o:
-            ob = obs_list[oi]
-            tr = Track(last_freq=ob.freq_mhz, last_utc=ob.utc, last_p=ob.p_dbfs, last_duty=ob.duty, points=[ob], misses=0)
-            tr.confirmed = (MIN_CONFIRM_SAMPLES <= 1)
-            active.append(tr)
-
-        still_active: List[Track] = []
-        for tr in active:
-            if tr.misses > MAX_MISSES:
-                finished.append(tr)
-            else:
-                still_active.append(tr)
-        active = still_active
-
-    return finished + active
-
-
-# -------------------------
-# Segments & aggregation (no rounding here)
-# -------------------------
-def split_continuous_segments(points: List[Obs]) -> List[List[Obs]]:
-    if not points:
-        return []
-    segs: List[List[Obs]] = []
-    cur: List[Obs] = [points[0]]
-    for i in range(1, len(points)):
-        if (points[i].utc - points[i - 1].utc) <= MAX_GAP:
-            cur.append(points[i])
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            self.parent[ra] = rb
+        elif self.rank[ra] > self.rank[rb]:
+            self.parent[rb] = ra
         else:
-            segs.append(cur)
-            cur = [points[i]]
-    segs.append(cur)
-    return segs
+            self.parent[rb] = ra
+            self.rank[ra] += 1
+
+
+def build_timefreq_components(df: pd.DataFrame,
+                              link_time_max: timedelta,
+                              link_freq_base_mhz: float,
+                              link_freq_per_sec_mhz: float) -> List[List[int]]:
+    """
+    Build connectivity by sweeping in time: for each point, only compare to
+    following points whose Δt ≤ link_time_max. Never link points with identical UTC.
+    Two points i<j are linked if:
+        Δt = (utc_j - utc_i) ≤ link_time_max
+        Δf = |f_j - f_i| ≤ link_freq_base_mhz + link_freq_per_sec_mhz * Δt_seconds
+    Returns components as lists of ORIGINAL DataFrame indices.
+    """
+    n = len(df)
+    if n == 0:
+        return []
+
+    # Sort by time; we do DSU in this sorted index space [0..n-1].
+    order = np.argsort(df["utc"].values)
+    t_sorted = df["utc"].values[order]         # datetime64[ns, UTC]
+    f_sorted = df["freq_mhz"].values[order]    # float
+    dsu = DSU(n)
+
+    # Convert link_time_max (datetime.timedelta) to numpy timedelta64 for safe comparison
+    max_dt_np = np.timedelta64(int(link_time_max.total_seconds()), 's')
+
+    j = 0
+    for i in range(n):
+        # advance j to maintain Δt <= link_time_max
+        while j < n and (t_sorted[j] - t_sorted[i]) <= max_dt_np:
+            j += 1
+        # compare i with (i+1...j-1)
+        for k in range(i + 1, j):
+            # Never link points with identical UTC (same FFT)
+            if t_sorted[k] == t_sorted[i]:
+                continue
+            dt_sec = float((t_sorted[k] - t_sorted[i]) / np.timedelta64(1, "s"))
+            dfreq = abs(float(f_sorted[k]) - float(f_sorted[i]))
+            tol = link_freq_base_mhz + link_freq_per_sec_mhz * dt_sec
+            if dfreq <= tol + 1e-12:
+                dsu.union(i, k)
+
+    # Gather components in sorted space, then map back to original indices.
+    comp_dict: Dict[int, List[int]] = {}
+    for pos in range(n):
+        root = dsu.find(pos)
+        comp_dict.setdefault(root, []).append(pos)
+
+    components: List[List[int]] = []
+    for _, pos_list in comp_dict.items():
+        orig_indices = order[np.array(pos_list, dtype=int)].tolist()
+        orig_indices.sort(key=lambda idx: df.loc[idx, "utc"])
+        components.append(orig_indices)
+    return components
+
+
+# -------------------------
+# Segmentation inside components
+# -------------------------
+df_global: pd.DataFrame = pd.DataFrame()  # populated in aggregate_df()
 
 
 @dataclass
 class Segment:
-    obs: List[Obs]
-    canonical: float | None = None
+    idxs: List[int]   # indices into original DataFrame
 
     @property
     def start(self) -> datetime:
-        return self.obs[0].utc
+        return df_global.loc[self.idxs[0], "utc"]
 
     @property
     def end(self) -> datetime:
-        return self.obs[-1].utc
+        return df_global.loc[self.idxs[-1], "utc"]
 
     @property
+    def samples(self) -> int:
+        return len(self.idxs)
+
     def mean_freq(self) -> float:
-        return float(np.mean([o.freq_mhz for o in self.obs]))
+        return float(np.mean(df_global.loc[self.idxs, "freq_mhz"].values))
 
-    def merge_with(self, other: "Segment") -> "Segment":
-        return Segment(obs=self.obs + other.obs, canonical=self.canonical)
+    def pwr_stats(self) -> Tuple[float, float]:
+        arr = df_global.loc[self.idxs, "p_dbfs"].values.astype(float)
+        return nanmean(arr), nansd(arr)
+
+    def duty_stats(self) -> Tuple[Optional[float], Optional[float]]:
+        arr = df_global.loc[self.idxs, "duty"].values.astype(float)
+        arr = arr[~np.isnan(arr)]
+        if arr.size == 0:
+            return None, None
+        return nanmean(arr), nansd(arr)
 
 
-def _track_canonical_freq(tr: "Track") -> float:
-    """Robust canonical for a track: median of the first N observations."""
-    if not tr.points:
-        return tr.last_freq
-    n = min(CANON_USE_FIRST_N, len(tr.points))
-    base = [o.freq_mhz for o in tr.points[:n]]
-    return float(np.median(base))
-
-
-def build_segments(tracks: List[Track]) -> List[Segment]:
+def cut_segments_in_component(comp_idxs: List[int], max_gap: timedelta) -> List[Segment]:
+    """Split a component into time-contiguous segments by max_gap."""
+    if not comp_idxs:
+        return []
+    comp_idxs = sorted(comp_idxs, key=lambda i: df_global.loc[i, "utc"])
     segs: List[Segment] = []
-    for tr in tracks:
-        if not tr.confirmed:
-            continue
-        canon = _track_canonical_freq(tr) if SNAP_TO_TRACK_CANONICAL else None
-        for seg in split_continuous_segments(tr.points):
-            if len(seg) < MIN_SEG_SAMPLES:
-                continue
-            segs.append(Segment(obs=seg, canonical=canon))
+    cur: List[int] = [comp_idxs[0]]
+    for i in range(1, len(comp_idxs)):
+        prev_t = df_global.loc[comp_idxs[i - 1], "utc"]
+        now_t = df_global.loc[comp_idxs[i], "utc"]
+        if (now_t - prev_t) <= max_gap:
+            cur.append(comp_idxs[i])
+        else:
+            segs.append(Segment(idxs=cur))
+            cur = [comp_idxs[i]]
+    segs.append(Segment(idxs=cur))
     return segs
 
 
-def merge_adjacent_segments(segs: List[Segment], gap_limit: timedelta, freq_tol: float) -> List[Segment]:
-    """Greedy merge of adjacent segments close in time & frequency."""
-    if not segs:
-        return segs
-    segs = sorted(segs, key=lambda s: (s.mean_freq, s.start, s.end))
-    merged: List[Segment] = []
-    cur = segs[0]
-    for nxt in segs[1:]:
-        time_gap = (nxt.start - cur.end)
-        if timedelta(0) <= time_gap <= gap_limit and abs(nxt.mean_freq - cur.mean_freq) <= freq_tol:
-            cur = cur.merge_with(nxt)
-        else:
-            merged.append(cur)
-            cur = nxt
-    merged.append(cur)
-    return merged
+# -------------------------
+# Canonical snapping (component-level)
+# -------------------------
+def component_canonical(comp_idxs: List[int], first_n: int) -> float:
+    """Median of the first N observations in a component."""
+    if not comp_idxs:
+        return float("nan")
+    comp_idxs = sorted(comp_idxs, key=lambda i: df_global.loc[i, "utc"])
+    n = min(first_n, len(comp_idxs))
+    vals = df_global.loc[comp_idxs[:n], "freq_mhz"].values.astype(float)
+    return float(np.median(vals))
 
 
-# -------------------------
-# Stage-1 snapping: per-track canonical (no rounding)
-# -------------------------
-def apply_track_canonical_snap(freq: float, canonical: Optional[float]) -> float:
-    if canonical is None:
-        return freq
-    if abs(freq - canonical) <= SNAP_TOL_MHZ:
+def apply_canonical_to_center(center: float, canonical: float, snap_tol: float) -> float:
+    """Return stabilized center (no rounding)."""
+    if not math.isnan(canonical) and abs(center - canonical) <= snap_tol:
         return canonical
-    return freq
+    return center
 
 
 # -------------------------
-# Stage-2 snapping: global modes via smoothed local peaks (no rounding)
+# Global complete-link clustering (physical tolerance)
 # -------------------------
-def _build_binned_counts(freqs: List[float], bin_step: float) -> Tuple[List[float], np.ndarray]:
-    """Return (centers, raw_counts) by binning freqs to nearest bin center."""
-    if not freqs:
-        return [], np.zeros(0, dtype=float)
-    def to_bin_center(x: float) -> float:
-        return round_to_step(x, bin_step)
-    counts: Dict[float, int] = {}
-    for x in freqs:
-        c = to_bin_center(x)
-        counts[c] = counts.get(c, 0) + 1
-    centers = sorted(counts.keys())
-    raw = np.array([counts[c] for c in centers], dtype=float)
-    return centers, raw
+def cluster_centers_complete_link(centers: List[float], weights: List[float], fuse_tol_mhz: float) -> Tuple[List[float], List[int]]:
+    """
+    1D complete-link clustering by maximum cluster span (MHz).
+    - Sort centers; start a cluster with first center; track cluster_min.
+    - If next value v satisfies v - cluster_min ≤ fuse_tol_mhz, keep in cluster.
+      Otherwise, close cluster and start a new one.
+    - Cluster representative = weighted median of member centers.
+    Returns (cluster_reps, assignment_index_per_center).
+    """
+    if not centers:
+        return [], []
 
+    v = np.asarray(centers, float)
+    w = np.asarray(weights, float)
+    order = np.argsort(v)
+    v_sorted = v[order]; w_sorted = w[order]
 
-def _smooth_counts(raw: np.ndarray) -> np.ndarray:
-    """3-point moving average smoothing."""
-    if raw.size < 3:
-        return raw.copy()
-    sm = raw.copy()
-    sm[1:-1] = (raw[:-2] + raw[1:-1] + raw[2:]) / 3.0
-    return sm
-
-
-def _local_peak_indices(centers: List[float], raw: np.ndarray, smoothed: np.ndarray, min_count: int) -> List[int]:
-    peaks: List[int] = []
-    for i in range(len(centers)):
-        if raw[i] < min_count:
+    clusters: List[Tuple[int, int]] = []  # (start_idx, end_idx_exclusive) in sorted space
+    start = 0
+    cluster_min = v_sorted[0]
+    for i in range(1, len(v_sorted)):
+        if (v_sorted[i] - cluster_min) <= fuse_tol_mhz + 1e-12:
             continue
-        left = smoothed[i - 1] if i - 1 >= 0 else -np.inf
-        right = smoothed[i + 1] if i + 1 < len(smoothed) else -np.inf
-        if smoothed[i] >= left and smoothed[i] >= right and (smoothed[i] > left or smoothed[i] > right):
-            peaks.append(i)
-    if not peaks and len(raw) > 0:
-        peaks = [int(np.argmax(raw))]
-    return peaks
-
-
-def _weighted_centroid(centers: List[float], raw: np.ndarray, i: int, window_bins: int) -> Tuple[float, float]:
-    lo = max(0, i - window_bins)
-    hi = min(len(centers) - 1, i + window_bins)
-    weights = raw[lo:hi + 1]
-    cvals = np.array(centers[lo:hi + 1], dtype=float)
-    if weights.sum() == 0:
-        return centers[i], 0.0
-    centroid = float(np.sum(weights * cvals) / np.sum(weights))
-    strength = float(np.sum(weights))
-    return centroid, strength
-
-
-def _fuse_close_peaks(mode_centroids: List[Tuple[float, float]], bin_step: float, merge_bins: int) -> List[float]:
-    """Fuse any two peak centroids whose distance <= merge_bins * bin_step."""
-    if not mode_centroids:
-        return []
-    # Sort by centroid
-    mode_centroids.sort(key=lambda t: t[0])
-    fused: List[Tuple[float, float]] = []
-    for c, s in mode_centroids:
-        if not fused:
-            fused.append((c, s))
-            continue
-        prev_c, prev_s = fused[-1]
-        if abs(c - prev_c) <= (merge_bins * bin_step + 1e-12):
-            # fuse by weighted centroid
-            total = prev_s + s
-            if total > 0:
-                new_c = (prev_c * prev_s + c * s) / total
-                new_s = total
-            else:
-                new_c, new_s = c, s
-            fused[-1] = (new_c, new_s)
         else:
-            fused.append((c, s))
-    return [c for c, _ in fused]
+            clusters.append((start, i))
+            start = i
+            cluster_min = v_sorted[i]
+    clusters.append((start, len(v_sorted)))
+
+    reps: List[float] = []
+    assign_sorted = np.full(len(v_sorted), -1, dtype=int)
+    for cid, (a, b) in enumerate(clusters):
+        rep = weighted_median(v_sorted[a:b], w_sorted[a:b])
+        reps.append(rep)
+        assign_sorted[a:b] = cid
+
+    # Map back to original order
+    assign = np.full(len(v), -1, dtype=int)
+    assign[order] = assign_sorted
+    return reps, assign.tolist()
 
 
-def _histogram_modes_strict(freqs: List[float],
-                            bin_step: float,
-                            min_count: int,
-                            peak_window_bins: int,
-                            strict_merge_bins: int) -> List[float]:
-    """Build global modes from smoothed histogram with STRICT adjacent-peak fusion."""
-    centers, raw = _build_binned_counts(freqs, bin_step)
-    if len(centers) == 0:
-        return []
-    smoothed = _smooth_counts(raw)
-    peak_idx = _local_peak_indices(centers, raw, smoothed, min_count=min_count)
+# -------------------------
+# Pipeline
+# -------------------------
+def aggregate_df(df: pd.DataFrame, args) -> pd.DataFrame:
+    global df_global
+    df_global = df
 
-    # Turn peak indices into (centroid, strength) tuples
-    candidates: List[Tuple[float, float]] = []
-    for i in peak_idx:
-        cen, stren = _weighted_centroid(centers, raw, i, window_bins=peak_window_bins)
-        candidates.append((cen, stren))
+    print(f"[dbg] input points: {len(df)}, unique UTC frames: {df['utc'].nunique()}")
 
-    # STRICT fuse of adjacent peaks within <= strict_merge_bins
-    modes = _fuse_close_peaks(candidates, bin_step=bin_step, merge_bins=strict_merge_bins)
-    modes.sort()
-    return modes
-
-
-def apply_global_mode_snap(freqs: List[float],
-                           bin_step: float,
-                           snap_tol: float,
-                           min_count: int,
-                           peak_window_bins: int,
-                           strict_merge_bins: int) -> List[float]:
-    """Snap each frequency to the nearest global mode if within tolerance."""
-    modes = _histogram_modes_strict(
-        freqs=freqs,
-        bin_step=bin_step,
-        min_count=min_count,
-        peak_window_bins=peak_window_bins,
-        strict_merge_bins=strict_merge_bins,
+    # 1) Connectivity components (time-frequency graph, no frame assumption)
+    comps = build_timefreq_components(
+        df=df,
+        link_time_max=timedelta(minutes=float(args.link_time_max_min)),
+        link_freq_base_mhz=float(args.link_freq_base_mhz),
+        link_freq_per_sec_mhz=float(args.link_freq_per_sec_mhz),
     )
-    if not modes:
-        return freqs[:]
-    out = []
-    for x in freqs:
-        m = min(modes, key=lambda z: abs(x - z))
-        out.append(m if abs(x - m) <= snap_tol else x)
-    return out
+    print(f"[dbg] components: {len(comps)}")
 
-
-# -------------------------
-# Finalization: build rows, snap, round, write
-# -------------------------
-def segments_to_rows(segs: List[Segment]) -> pd.DataFrame:
-    """Return a DataFrame with float frequencies (no rounding yet)."""
+    # 2) Cut segments inside each component; compute (optional) canonical
+    all_segments: List[Segment] = []
+    seg_centers: List[float] = []
+    seg_weights: List[int] = []
     rows: List[Dict[str, object]] = []
-    for s in segs:
-        t_start = s.start
-        t_end = s.end
-        freqs = [p.freq_mhz for p in s.obs]
-        pwr = [p.p_dbfs for p in s.obs]
-        duty_vals = [p.duty for p in s.obs if not math.isnan(p.duty)]
-        seg_mean = float(np.mean(freqs))
 
-        # stage-1: snap to track canonical (no rounding)
-        seg_stab = apply_track_canonical_snap(seg_mean, s.canonical)
+    for comp in comps:
+        segs = cut_segments_in_component(comp, max_gap=timedelta(minutes=float(args.max_gap_min)))
+        if not segs:
+            continue
+        all_segments.extend(segs)
 
-        rows.append(dict(
-            start_utc=t_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            end_utc=t_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            freq_float=seg_stab,
-            samples=int(len(s.obs)),
-            pwr_avg=round(nanmean(pwr), 3),
-            pwr_sd=round(nansd(pwr), 3),
-            duty_avg=(None if not duty_vals else round(nanmean(duty_vals), 3)),
-            duty_sd=(None if not duty_vals else round(nansd(duty_vals), 3)),
-        ))
-    return pd.DataFrame.from_records(rows)
+        canonical = component_canonical(comp, first_n=int(args.canon_use_first_n)) if int(args.snap_to_canonical) == 1 else float("nan")
+
+        for seg in segs:
+            m = seg.mean_freq()
+            m_stab = apply_canonical_to_center(m, canonical, snap_tol=float(args.snap_tol_mhz)) if int(args.snap_to_canonical) == 1 else m
+
+            pavg, psd = seg.pwr_stats()
+            davg, dsd = seg.duty_stats()
+
+            seg_centers.append(m_stab)
+            seg_weights.append(seg.samples)
+
+            rows.append(dict(
+                start_utc=seg.start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                end_utc=seg.end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                freq_float=m_stab,         # not rounded yet
+                samples=int(seg.samples),
+                pwr_avg=round(pavg, 3),
+                pwr_sd=round(psd, 3),
+                duty_avg=(None if davg is None else round(davg, 3)),
+                duty_sd=(None if dsd is None else round(dsd, 3)),
+            ))
+
+    print(f"[dbg] segments(before global cluster): {len(seg_centers)}")
+    df_rows = pd.DataFrame.from_records(rows)
+    if df_rows.empty:
+        return df_rows
+
+    # 3) Stage-2 global complete-link clustering (physical tolerance)
+    reps, assign = cluster_centers_complete_link(seg_centers, seg_weights, fuse_tol_mhz=float(args.fuse_tol_mhz))
+    snapped = [reps[k] if (0 <= k < len(reps)) else c for c, k in zip(seg_centers, assign)]
+    df_rows["freq_float"] = snapped
+
+    return df_rows
 
 
-def finalize_and_write(df_rows: pd.DataFrame,
-                       out_path: str,
-                       round_step: float,
-                       do_global_snap: bool,
-                       global_params: Dict[str, float | int]) -> pd.DataFrame:
-    """Apply stage-2 global snapping (optional), then final rounding and write CSV."""
+# -------------------------
+# Finalize & write
+# -------------------------
+def finalize_and_write(df_rows: pd.DataFrame, out_path: str, round_step: float) -> pd.DataFrame:
+    """Final rounding (only here) and write CSV."""
     if df_rows.empty:
         out_df = pd.DataFrame(columns=["start_utc", "end_utc", "freq", "samples", "pwr_avg", "pwr_sd", "duty_avg", "duty_sd"])
         out_df.to_csv(out_path, index=False)
@@ -555,173 +459,75 @@ def finalize_and_write(df_rows: pd.DataFrame,
         print(f"[i] unique frequencies: 0")
         return out_df
 
-    freqs = df_rows["freq_float"].tolist()
-
-    if do_global_snap:
-        freqs = apply_global_mode_snap(
-            freqs=freqs,
-            bin_step=float(global_params["bin_step"]),
-            snap_tol=float(global_params["snap_tol"]),
-            min_count=int(global_params["min_count"]),
-            peak_window_bins=int(global_params["peak_window"]),
-            strict_merge_bins=int(global_params["strict_merge_bins"]),
-        )
-
-    # final rounding ONLY here
-    df_rows["freq"] = [round_to_step(x, round_step) for x in freqs]
+    df_rows = df_rows.copy()
+    df_rows["freq"] = [round_to_step(x, round_step) for x in df_rows["freq_float"].astype(float)]
 
     out_df = df_rows[["start_utc", "end_utc", "freq", "samples", "pwr_avg", "pwr_sd", "duty_avg", "duty_sd"]].copy()
     out_df = out_df.sort_values(["freq", "start_utc"]).reset_index(drop=True)
     out_df.to_csv(out_path, index=False)
 
-    unique_freqs = out_df["freq"].nunique()
     print(f"[i] wrote: {out_path} ({len(out_df)} rows)")
-    print(f"[i] unique frequencies: {unique_freqs}")
+    print(f"[i] unique frequencies: {out_df['freq'].nunique()}")
     return out_df
 
 
 # -------------------------
-# Top-level aggregation
-# -------------------------
-def build_segments(tracks: List[Track]) -> List[Segment]:
-    segs: List[Segment] = []
-    for tr in tracks:
-        if not tr.confirmed:
-            continue
-        canon = _track_canonical_freq(tr) if SNAP_TO_TRACK_CANONICAL else None
-        for seg in split_continuous_segments(tr.points):
-            if len(seg) < MIN_SEG_SAMPLES:
-                continue
-            segs.append(Segment(obs=seg, canonical=canon))
-    return segs
-
-
-def aggregate_df(df: pd.DataFrame, out_path: str, args) -> pd.DataFrame:
-    tracks = track_frequencies_by_frame(df)
-    segs = build_segments(tracks)
-
-    # Optional adjacent-merge
-    if args.merge_gap_min > 0 and args.merge_freq_tol > 0:
-        segs = merge_adjacent_segments(
-            segs,
-            gap_limit=timedelta(minutes=float(args.merge_gap_min)),
-            freq_tol=float(args.merge_freq_tol),
-        )
-
-    df_rows = segments_to_rows(segs)
-
-    out_df = finalize_and_write(
-        df_rows=df_rows,
-        out_path=out_path,
-        round_step=float(args.round_freq),
-        do_global_snap=bool(args.global_snap_to_modes),
-        global_params=dict(
-            bin_step=float(args.global_bin_step),
-            snap_tol=float(args.global_snap_tol_mhz),
-            min_count=int(args.global_mode_min_seg),
-            peak_window=int(args.global_peak_window),
-            strict_merge_bins=int(args.global_strict_merge_bins),
-        ),
-    )
-    return out_df
-
-
-def aggregate(directory: Optional[str], file_path: Optional[str], out_path: str, args) -> None:
-    if file_path:
-        df = load_rows_from_csv(file_path)
-    else:
-        df = load_all_rows(directory if directory else "./")
-    if df.empty:
-        out_df = pd.DataFrame(columns=["start_utc", "end_utc", "freq", "samples", "pwr_avg", "pwr_sd", "duty_avg", "duty_sd"])
-        out_df.to_csv(out_path, index=False)
-        print(f"[i] no data. wrote empty CSV: {out_path}")
-        print(f"[i] unique frequencies: 0")
-        return
-
-    out_df = aggregate_df(df, out_path, args)
-
-    if args.stats_out:
-        stats = dict(
-            rows=int(len(out_df)),
-            unique_freqs=int(out_df["freq"].nunique()),
-        )
-        with open(args.stats_out, "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2)
-        print(f"[i] wrote stats: {args.stats_out}")
-
-
-# -------------------------
-# CLI
+# Main entry
 # -------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Aggregate RF scan CSVs into continuous segments with temporal tracking and robust two-stage frequency stabilization.")
+    ap = argparse.ArgumentParser(description="RF aggregator for sliding-window scans using time–frequency connectivity + complete-link clustering.")
     # Inputs
     ap.add_argument("--dir", default="./", help="Directory to recursively read CSVs from (default: ./). Ignored if --file is provided.")
     ap.add_argument("--file", default=None, help="Read a single CSV file (overrides --dir).")
     ap.add_argument("--out", default="aggregated_signals.csv", help="Output CSV filename (default: aggregated_signals.csv)")
 
-    # Matching & tracking
-    ap.add_argument("--freq_tol", type=float, default=0.0012, help="Base frequency tolerance (MHz) for matching across frames.")
-    ap.add_argument("--freq_tol_per_sec", type=float, default=0.0, help="Extra tolerance per second (MHz/s) between frames.")
-    ap.add_argument("--continue_tol_mult", type=float, default=1.6, help="Continuation tolerance multiplier (hysteresis).")
-    ap.add_argument("--max_gap_min", type=float, default=10.0, help="Max gap (minutes) inside one continuous segment (default: 10).")
-    ap.add_argument("--max_misses", type=int, default=2, help="Max consecutive frame misses before a track is terminated (default: 2).")
-    ap.add_argument("--min_seg_samples", type=int, default=1, help="Minimum samples per segment to keep (default: 1).")
-    ap.add_argument("--min_confirm_samples", type=int, default=2, help="Minimum samples needed to confirm a track (default: 2).")
-    ap.add_argument("--vel_alpha", type=float, default=0.5, help="EMA factor for velocity (df/dt).")
+    # Connectivity (graph) parameters
+    ap.add_argument("--link_time_max_min", type=float, default=30.0, help="Max time gap (minutes) to allow linking across observations (default: 30).")
+    ap.add_argument("--link_freq_base_mhz", type=float, default=0.0012, help="Base frequency tolerance (MHz) for linking (default: 0.0012).")
+    ap.add_argument("--link_freq_per_sec_mhz", type=float, default=0.0000002, help="Extra tolerance per second (MHz/s) with time gap for linking (default: 2e-7 MHz/s = 0.2 Hz/s).")
 
-    # Post merge (adjacent segments)
-    ap.add_argument("--merge_gap_min", type=float, default=1.0, help="Post-merge max time gap between adjacent segments in minutes (default: 1.0).")
-    ap.add_argument("--merge_freq_tol", type=float, default=0.0015, help="Post-merge frequency tolerance in MHz (default: 0.0015).")
+    # Segmentation
+    ap.add_argument("--max_gap_min", type=float, default=10.0, help="Segment break if time gap exceeds this many minutes (default: 10).")
 
-    # Stage-1: track canonical snapping
-    ap.add_argument("--snap_to_track_canonical", type=int, default=1, help="1 to snap segment freq to track canonical if close (default: 1).")
-    ap.add_argument("--snap_tol_mhz", type=float, default=0.0015, help="Tolerance (MHz) to snap a segment to its track canonical (default: 0.0015).")
-    ap.add_argument("--canon_use_first_n", type=int, default=5, help="Use first N observations of the track to compute canonical freq (default: 5).")
+    # Canonical snapping
+    ap.add_argument("--snap_to_canonical", type=int, default=1, help="1 to enable per-component canonical snap (default: 1).")
+    ap.add_argument("--snap_tol_mhz", type=float, default=0.0015, help="Tolerance (MHz) to snap a segment to its component canonical.")
+    ap.add_argument("--canon_use_first_n", type=int, default=5, help="Use first N observations of a component to compute canonical.")
 
-    # Stage-2: global mode snapping (smoothed local peaks with STRICT fusion)
-    ap.add_argument("--global_snap_to_modes", type=int, default=1, help="1 to snap frequencies to global modes (default: 1).")
-    ap.add_argument("--global_bin_step", type=float, default=0.001, help="Histogram bin step in MHz (default: 0.001).")
-    ap.add_argument("--global_snap_tol_mhz", type=float, default=0.0015, help="Tolerance (MHz) to snap to nearest global mode (default: 0.0015).")
-    ap.add_argument("--global_mode_min_seg", type=int, default=1, help="Minimum segments in a bin to consider it for peak selection (default: 1).")
-    ap.add_argument("--global_peak_window", type=int, default=1, help="±window (in bins) around a peak for weighted centroid (default: 1).")
-    ap.add_argument("--global_strict_merge_bins", type=int, default=1, help="Fuse peaks whose distance <= this many bins by weighted centroid (default: 1).")
+    # Global clustering
+    ap.add_argument("--fuse_tol_mhz", type=float, default=0.0008, help="Global complete-link max span per cluster in MHz (default: 0.0008).")
 
     # Final rounding & stats
-    ap.add_argument("--round_freq", type=float, default=0.001, help="Final rounding step in MHz (default: 0.001).")
-    ap.add_argument("--stats_out", default=None, help="Optional path to write a small JSON with {'rows', 'unique_freqs'}.")
+    ap.add_argument("--round_freq", type=float, default=0.001, help="Final rounding step in MHz (Decimal half-up; default: 0.001).")
+    ap.add_argument("--stats_out", default=None, help="Optional path to write JSON with {'rows','unique_freqs'}.")
 
     args = ap.parse_args()
 
-    # Bind CLI to globals
-    global FREQ_TOL, FREQ_TOL_PER_SEC, CONTINUE_TOL_MULT, MAX_GAP, MAX_MISSES
-    global ROUND_FREQ, MIN_SEG_SAMPLES, MIN_CONFIRM_SAMPLES, VEL_ALPHA
-    global SNAP_TO_TRACK_CANONICAL, SNAP_TOL_MHZ, CANON_USE_FIRST_N
-    global GLOBAL_SNAP_TO_MODES, GLOBAL_BIN_STEP, GLOBAL_SNAP_TOL_MHZ
-    global GLOBAL_MODE_MIN_SEG, GLOBAL_PEAK_WINDOW, GLOBAL_STRICT_MERGE_BINS
+    # Load data
+    if args.file:
+        df = load_rows_from_csv(args.file)
+    else:
+        df = load_all_rows(args.dir)
 
-    FREQ_TOL = float(args.freq_tol)
-    FREQ_TOL_PER_SEC = float(args.freq_tol_per_sec)
-    CONTINUE_TOL_MULT = float(args.continue_tol_mult)
-    MAX_GAP = timedelta(minutes=float(args.max_gap_min))
-    MAX_MISSES = int(args.max_misses)
-    ROUND_FREQ = float(args.round_freq)
-    MIN_SEG_SAMPLES = int(args.min_seg_samples)
-    MIN_CONFIRM_SAMPLES = int(args.min_confirm_samples)
-    VEL_ALPHA = float(args.vel_alpha)
+    if df.empty:
+        out_df = pd.DataFrame(columns=["start_utc", "end_utc", "freq", "samples", "pwr_avg", "pwr_sd", "duty_avg", "duty_sd"])
+        out_df.to_csv(args.out, index=False)
+        print(f"[i] no data. wrote empty CSV: {args.out}")
+        print(f"[i] unique frequencies: 0")
+        return
 
-    SNAP_TO_TRACK_CANONICAL = bool(int(args.snap_to_track_canonical))
-    SNAP_TOL_MHZ = float(args.snap_tol_mhz)
-    CANON_USE_FIRST_N = int(args.canon_use_first_n)
+    # Aggregate
+    df_rows = aggregate_df(df, args)
 
-    GLOBAL_SNAP_TO_MODES = bool(int(args.global_snap_to_modes))
-    GLOBAL_BIN_STEP = float(args.global_bin_step)
-    GLOBAL_SNAP_TOL_MHZ = float(args.global_snap_tol_mhz)
-    GLOBAL_MODE_MIN_SEG = int(args.global_mode_min_seg)
-    GLOBAL_PEAK_WINDOW = int(args.global_peak_window)
-    GLOBAL_STRICT_MERGE_BINS = int(args.global_strict_merge_bins)
+    # Finalize & write
+    out_df = finalize_and_write(df_rows, out_path=args.out, round_step=float(args.round_freq))
 
-    aggregate(args.dir, args.file, args.out, args)
+    # Stats out
+    if args.stats_out:
+        stats = dict(rows=int(len(out_df)), unique_freqs=int(out_df["freq"].nunique()))
+        with open(args.stats_out, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+        print(f"[i] wrote stats: {args.stats_out}")
 
 
 if __name__ == "__main__":
