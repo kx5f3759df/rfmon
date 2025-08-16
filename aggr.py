@@ -10,7 +10,7 @@ Rules:
 - Duty uses the "duty" column (single-bin). If only duty in % under a different
   name is present (e.g., duty_center_pct / duty_pct), it will be used.
 - Output a single CSV with columns:
-  开始时间(utc), 结束时间(utc), 频率, 样本数, 平均信号强度, 信号强度标准差, 平均占空比, 占空比标准差
+  start_utc, end_utc, freq, samples, pwr_avg, pwr_sd, duty_avg, duty_sd
 
 Usage:
   python aggregate_signals.py [--dir DIR] [--out OUT.csv]
@@ -158,7 +158,7 @@ def aggregate(indir: str, out_path: str) -> None:
     df = load_all_csvs(indir)
     if df.empty:
         # write empty CSV with header
-        cols = ["开始时间(utc)","结束时间(utc)","频率","样本数","平均信号强度","信号强度标准差","平均占空比","占空比标准差"]
+        cols = ["start_utc","end_utc","freq","samples","pwr_avg","pwr_sd","duty_avg","duty_sd"]
         pd.DataFrame(columns=cols).to_csv(out_path, index=False)
         print(f"[i] no valid rows found. Wrote empty file: {out_path}")
         return
@@ -205,18 +205,18 @@ def aggregate(indir: str, out_path: str) -> None:
             t_end   = seg["utc"].iloc[-1].astimezone(timezone.utc)
 
             records.append({
-                "开始时间(utc)": t_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "结束时间(utc)": t_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "频率": f_out,
-                "样本数": int(len(seg)),
-                "平均信号强度": round(p_mean, 3),
-                "信号强度标准差": round(p_std, 3),
-                "平均占空比": None if math.isnan(d_mean) else round(d_mean, 2),
-                "占空比标准差": None if math.isnan(d_std) else round(d_std, 2),
+                "start_utc": t_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end_utc": t_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "freq": f_out,
+                "samples": int(len(seg)),
+                "pwr_avg": round(p_mean, 3),
+                "pwr_sd": round(p_std, 3),
+                "duty_avg": None if math.isnan(d_mean) else round(d_mean, 2),
+                "duty_sd": None if math.isnan(d_std) else round(d_std, 2),
             })
 
     out_df = pd.DataFrame.from_records(records, columns=[
-        "开始时间(utc)","结束时间(utc)","频率","样本数","平均信号强度","信号强度标准差","平均占空比","占空比标准差"
+        "start_utc","end_utc","freq","samples","pwr_avg","pwr_sd","duty_avg","duty_sd"
     ])
 
     out_df.to_csv(out_path, index=False, encoding="utf-8")

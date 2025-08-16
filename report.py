@@ -1,12 +1,18 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Build time-frequency overview charts and weekly heatmaps; Chinese CSV headers; English UI.
 # Tabs for each frequency now show a progress-fill background that encodes occupancy:
 # <30% green, 30–70% yellow, >70% red. The fill extends from the left to the occupancy %.
+#
+# Added:
+# - tz_offset_hours CLI/param (e.g., +8 or -12). All timelines, heatmap bins, and tables
+#   use time shifted from UTC by this offset. Axis labels and table headers show "UTC±Xh".
+
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Dict
+import argparse
+
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -62,20 +68,27 @@ def _merge_intervals_total_duration(intervals: List[Tuple[datetime, datetime]]) 
     total = sum((e - s).total_seconds() for s, e in merged)
     return float(total)
 
-def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'report') -> None:
+def build_report(input_csv: str = 'aggregated_signals.csv',
+                 out_dir: str = 'report',
+                 tz_offset_hours: int = 0) -> None:
+    tz_delta = timedelta(hours=int(tz_offset_hours))
+    tz_label = f"UTC{int(tz_offset_hours):+d}h"
+
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     csv_path = Path(input_csv)
     if not csv_path.exists():
         raise FileNotFoundError(f'File not found: {input_csv}. Please generate it first.')
     df = pd.read_csv(csv_path)
-    req = ['开始时间(utc)', '结束时间(utc)', '频率']
+    req = ['start_utc', 'end_utc', 'freq']
     for col in req:
         if col not in df.columns:
             raise ValueError(f'Missing column: {col}')
-    df['t_start'] = df['开始时间(utc)'].map(parse_ts_utc)
-    df['t_end']   = df['结束时间(utc)'].map(parse_ts_utc)
-    df['freq']    = pd.to_numeric(df['频率'], errors='coerce')
+
+    # Parse as UTC, then shift to local (offset) time for all downstream logic/plots/tables
+    df['t_start'] = df['start_utc'].map(parse_ts_utc) + tz_delta
+    df['t_end']   = df['end_utc'].map(parse_ts_utc) + tz_delta
+    df['freq']    = pd.to_numeric(df['freq'], errors='coerce')
     df['t_mid']   = df['t_start'] + (df['t_end'] - df['t_start']) / 2
     df = df.dropna(subset=['t_start','t_end','t_mid','freq']).sort_values('t_start').reset_index(drop=True)
     if df.empty:
@@ -87,11 +100,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
         return tab(i % tab.N)
     freq_color: Dict[float, tuple] = {f: color_for_idx(i) for i, f in enumerate(freqs)}
 
-    # --- New: compute occupancy per frequency (union of active times) ---
-    # Occupancy definition:
-    # - Denominator: from earliest start to latest end among ALL records of this frequency,
-    #   including zero-duration rows (they participate in min/max).
-    # - Numerator: union of active intervals for rows with duration > 0 only.
+    # --- Compute occupancy per frequency (union of active times) ---
     occupancy_pct: Dict[float, float] = {}
     for f in freqs:
         sub = df[df['freq_key'] == f]
@@ -101,11 +110,9 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
         earliest = min(sub['t_start'])
         latest   = max(sub['t_end'])
         total_span = max(3 * 3600.0, (latest - earliest).total_seconds())
-        # Build intervals only for positive-duration rows
         intervals = [(row['t_start'], row['t_end']) for _, row in sub.iterrows() if row['t_end'] > row['t_start']]
         active_seconds = _merge_intervals_total_duration(intervals)
         occ = (active_seconds / total_span) if total_span > 0 else 0.0
-        # Clamp to [0,1]
         occ = float(max(0.0, min(1.0, occ)))
         occupancy_pct[f] = occ
 
@@ -119,11 +126,14 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
         ('7d', timedelta(days=7)),
         ('30d', timedelta(days=30)),
     ]
-    now = datetime.now(timezone.utc)
+    # "now" in shifted (local) time
+    now_local = datetime.now(timezone.utc) + tz_delta
+
     overview_images: List[Tuple[str,str]] = []
     for label, delta in windows:
-        t_from = now - delta
+        t_from = now_local - delta
         sub = df[df['t_end'] >= t_from].copy()  # overlap with window
+
         # Dynamic height: >=25 px per 1 MHz at 150 DPI
         dpi = 150
         base_min_px = 600  # 4 inches baseline
@@ -135,13 +145,14 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
             span_mhz = max(0.0, float(ymax - ymin))
         height_px = max(25.0 * span_mhz, base_min_px)
         height_in = height_px / dpi
+
         fig = plt.figure(figsize=(12, height_in), dpi=dpi)
         plt.grid(True, alpha=0.3)
         if sub.empty:
             plt.title(f'Last {label} (no data)')
-            plt.xlabel('Time (UTC)')
+            plt.xlabel(f'Time ({tz_label})')
             plt.ylabel('Frequency (MHz)')
-            plt.xlim(t_from, now)
+            plt.xlim(t_from, now_local)
             plt.tight_layout()
         else:
             sub['freq_key'] = sub['freq'].round(3)
@@ -151,7 +162,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
                 freq_rows = sub[sub['freq_key'] == f]
                 for _, row in freq_rows.iterrows():
                     x0 = max(row['t_start'], t_from)
-                    x1 = min(row['t_end'], now)
+                    x1 = min(row['t_end'], now_local)
                     if x1 <= x0:
                         continue
                     if f not in labeled:
@@ -166,9 +177,9 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
             plt.yticks(np.arange(start_tick, end_tick + 5, 5))
             plt.gca().yaxis.set_major_formatter(FormatStrFormatter('%d'))
             plt.title(f'Last {label}: Frequency activity overview')
-            plt.xlabel('Time (UTC)')
+            plt.xlabel(f'Time ({tz_label})')
             plt.ylabel('Frequency (MHz)')
-            plt.xlim(t_from, now)
+            plt.xlim(t_from, now_local)
             n_unique = len(sub['freq_key'].unique())
             ncol = max(1, min(6, n_unique))
             plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.18), ncol=ncol, frameon=True)
@@ -178,39 +189,48 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
         plt.close(fig)
         overview_images.append((label, fname))
 
+    # --- Weekly heatmaps & tables (shifted time) ---
     heatmap_images: List[Tuple[float,str]] = []
     table_html_map: Dict[float, str] = {}
-    col_order = ['开始时间(utc)','结束时间(utc)','频率','样本数','平均信号强度','信号强度标准差','平均占空比','占空比标准差']
-    col_rename = {
-        '开始时间(utc)': 'Start (UTC)',
-        '结束时间(utc)': 'End (UTC)',
-        '频率': 'Freq (MHz)',
-        '样本数': 'Samples',
-        '平均信号强度': 'Avg Power (dBFS)',
-        '信号强度标准差': 'Power Std',
-        '平均占空比': 'Avg Duty',
-        '占空比标准差': 'Duty Std',
+
+    # NOTE: table headers reflect shifted tz
+    col_order = ['start_utc','end_utc','freq','samples','pwr_avg','pwr_sd','duty_avg','duty_sd']
+    col_rename_display = {
+        'start_utc': 'Start (UTC)',
+        'end_utc': 'End (UTC)',
+        'freq': 'Freq (MHz)',
+        'samples': 'Samples',
+        'pwr_avg': 'Avg Power (dBFS)',
+        'pwr_sd': 'Power Std',
+        'duty_avg': 'Avg Duty',
+        'duty_sd': 'Duty Std',
     }
+    start_col_name = f'Start ({tz_label})'
+    end_col_name   = f'End ({tz_label})'
+
     for f in freqs:
         g = df[df['freq_key'] == f].copy()
-        seen = set()  # (date_iso, hour)
+
+        # Build hour bins in shifted time
+        seen = set()  # (date_iso, hour, weekday)
         for _, row in g.iterrows():
             cur = row['t_start'].replace(minute=0, second=0, microsecond=0)
             end = row['t_end']
             while cur < end:
-                seen.add((cur.date().isoformat(), cur.hour))
+                seen.add((cur.date().isoformat(), cur.hour, cur.weekday()))
                 cur = cur + timedelta(hours=1)
+
         mat = np.zeros((24,7), dtype=int)
-        for date_iso, hour in seen:
-            y, m, d = map(int, date_iso.split('-'))
-            wd = datetime(y, m, d, tzinfo=timezone.utc).weekday()
-            mat[hour, wd] += 1
+        for date_iso, hour, wd in seen:
+            if 0 <= hour <= 23 and 0 <= wd <= 6:
+                mat[hour, wd] += 1
+
         fig = plt.figure(figsize=(7, 6))
         ax = plt.gca()
         im = ax.imshow(mat, aspect='auto', origin='lower')
         plt.title(f'{f:.3f} MHz - Weekly activity heatmap')
         plt.xlabel('Weekday (Mon=0 ... Sun=6)')
-        plt.ylabel('Hour (UTC)')
+        plt.ylabel(f'Hour ({tz_label})')
         cbar = plt.colorbar(im)
         cbar.set_label('Unique active days')
         ax.set_xticks(range(7))
@@ -224,19 +244,35 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
         fig.savefig(out_path / fname, dpi=150)
         plt.close(fig)
         heatmap_images.append((f, fname))
+
+        # ----- Frequency table (shifted Start/End) -----
+        # Try to include known columns if present
         cols_exist = [c for c in col_order if c in g.columns]
-        if not cols_exist:
-            tbl = g[['开始时间(utc)','结束时间(utc)','频率']].sort_values('开始时间(utc)').copy()
-            tbl['频率'] = pd.to_numeric(tbl['频率'], errors='coerce').round(3)
-            tbl = tbl.rename(columns={'开始时间(utc)':'Start (UTC)','结束时间(utc)':'End (UTC)','频率':'Freq (MHz)'})
-            table_html_map[f] = tbl.to_html(index=False, escape=True, border=0, classes='datatable')
-        else:
-            tbl = g.sort_values('开始时间(utc)')[cols_exist].copy()
-            if '频率' in tbl.columns:
-                tbl['频率'] = pd.to_numeric(tbl['频率'], errors='coerce').round(3)
-            rename_map = {k:v for k,v in col_rename.items() if k in tbl.columns}
+        # We'll render Start/End from shifted timestamps regardless
+        fmt_time = '%Y-%m-%d %H:%M:%S'
+        start_series = g['t_start']
+        end_series   = g['t_end']
+        # Build base display DataFrame in time order
+        base = pd.DataFrame({
+            start_col_name: start_series.dt.strftime(fmt_time),
+            end_col_name:   end_series.dt.strftime(fmt_time),
+        })
+        if cols_exist:
+            tbl = g.sort_values('t_start')[cols_exist].copy()
+            if 'freq' in tbl.columns:
+                tbl['freq'] = pd.to_numeric(tbl['freq'], errors='coerce').round(3)
+            rename_map = {k:v for k,v in col_rename_display.items() if k in tbl.columns}
             tbl = tbl.rename(columns=rename_map)
-            table_html_map[f] = tbl.to_html(index=False, escape=True, border=0, classes='datatable')
+            # Combine: place Start/End first
+            tbl_disp = pd.concat([base.reset_index(drop=True), tbl.reset_index(drop=True)], axis=1)
+            table_html_map[f] = tbl_disp.to_html(index=False, escape=True, border=0, classes='datatable')
+        else:
+            # Fallback minimal columns
+            fallback = pd.DataFrame({
+                'Freq (MHz)': pd.to_numeric(g['freq'], errors='coerce').round(3)
+            })
+            tbl_disp = pd.concat([base.reset_index(drop=True), fallback.reset_index(drop=True)], axis=1)
+            table_html_map[f] = tbl_disp.to_html(index=False, escape=True, border=0, classes='datatable')
 
     # --- HTML with occupancy progress on frequency tabs ---
     html_path = out_path / 'report.html'
@@ -309,6 +345,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
     html_head.append('</head>')
     html_head.append('<body>')
     html_head.append('<h1>Spectrum Occupancy Report</h1>')
+    html_head.append(f'<p style="margin-top:-8px; color:#555;">Times shown in {tz_label} (shifted from CSV UTC)</p>')
     html_head.append('<div id="top">')
     html_head.append('  <div class="tabbar" id="topTabs">')
     html_head.append('    __TOP_TABS__')
@@ -350,5 +387,13 @@ def build_report(input_csv: str = 'aggregated_signals.csv', out_dir: str = 'repo
     html_path.write_text(html, encoding='utf-8')
     print(f'[i] Report generated: {html_path}')
 
+def _parse_args():
+    ap = argparse.ArgumentParser(description="Generate spectrum occupancy report with optional time-zone hour offset.")
+    ap.add_argument("--input-csv", default="aggregated_signals.csv", help="Input aggregated CSV (default: aggregated_signals.csv)")
+    ap.add_argument("--out-dir", default="report", help="Output directory for HTML and images (default: report)")
+    ap.add_argument("--tz-offset", type=int, default=0, help="Hour offset from UTC, e.g., +8 for UTC+8, -12 for UTC-12 (default: 0)")
+    return ap.parse_args()
+
 if __name__ == '__main__':
-    build_report()
+    args = _parse_args()
+    build_report(input_csv=args.input_csv, out_dir=args.out_dir, tz_offset_hours=args.tz_offset)
