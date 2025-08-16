@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Build time-frequency overview charts and weekly heatmaps; Chinese CSV headers; English UI.
-# Tabs for each frequency now show a progress-fill background that encodes occupancy:
+# Build time-frequency overview charts and weekly heatmaps; CSV uses Chinese headers in source data,
+# while the UI is in English. Each frequency tab shows a progress-fill background that encodes occupancy:
 # <30% green, 30–70% yellow, >70% red. The fill extends from the left to the occupancy %.
 #
 # Added:
@@ -15,10 +15,13 @@ import argparse
 
 import pandas as pd
 import numpy as np
+import json
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 def parse_ts_utc(s: str) -> datetime:
+    """Parse a timestamp string as UTC-aware datetime."""
     s = str(s)
     try:
         if s.endswith('Z'):
@@ -28,6 +31,7 @@ def parse_ts_utc(s: str) -> datetime:
         return pd.to_datetime(s, utc=True).to_pydatetime()
 
 def freq_limits_with_padding(freq_series: pd.Series, pad_ratio: float = 0.05) -> Tuple[float, float]:
+    """Compute y-axis limits with small padding; handle edge cases."""
     fmin = float(freq_series.min())
     fmax = float(freq_series.max())
     if not np.isfinite(fmin) or not np.isfinite(fmax):
@@ -40,6 +44,7 @@ def freq_limits_with_padding(freq_series: pd.Series, pad_ratio: float = 0.05) ->
     return fmin - pad, fmax + pad
 
 def rgba_to_hex(rgba) -> str:
+    """Convert RGBA tuple to hex color string."""
     r, g, b, a = rgba
     return '#{:02x}{:02x}{:02x}'.format(int(max(0,min(1,r))*255), int(max(0,min(1,g))*255), int(max(0,min(1,b))*255))
 
@@ -58,7 +63,7 @@ def _merge_intervals_total_duration(intervals: List[Tuple[datetime, datetime]]) 
     cur_s, cur_e = norm[0]
     for s, e in norm[1:]:
         if s <= cur_e:
-            # overlap / touch
+            # Overlap or touching intervals
             if e > cur_e:
                 cur_e = e
         else:
@@ -70,7 +75,10 @@ def _merge_intervals_total_duration(intervals: List[Tuple[datetime, datetime]]) 
 
 def build_report(input_csv: str = 'aggregated_signals.csv',
                  out_dir: str = 'report',
-                 tz_offset_hours: int = 0) -> None:
+                 tz_offset_hours: int = 0,
+                 f_start: float = None,
+                 f_stop: float = None) -> None:
+    """Generate the HTML report with overview plots, heatmaps, and tables."""
     tz_delta = timedelta(hours=int(tz_offset_hours))
     tz_label = f"UTC{int(tz_offset_hours):+d}h"
 
@@ -80,10 +88,14 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
     if not csv_path.exists():
         raise FileNotFoundError(f'File not found: {input_csv}. Please generate it first.')
     df = pd.read_csv(csv_path)
-    if args.f_start is not None:
-        df = df[df["freq"] >= args.f_start]
-    if args.f_stop is not None:
-        df = df[df["freq"] <= args.f_stop]
+
+    # Optional frequency filtering based on function params
+    if f_start is not None:
+        df = df[df["freq"] >= f_start]
+    if f_stop is not None:
+        df = df[df["freq"] <= f_stop]
+
+    # Required columns
     req = ['start_utc', 'end_utc', 'freq']
     for col in req:
         if col not in df.columns:
@@ -113,6 +125,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
             continue
         earliest = min(sub['t_start'])
         latest   = max(sub['t_end'])
+        # Use at least 3 hours baseline to avoid inflated occupancy on tiny spans
         total_span = max(3 * 3600.0, (latest - earliest).total_seconds())
         intervals = [(row['t_start'], row['t_end']) for _, row in sub.iterrows() if row['t_end'] > row['t_start']]
         active_seconds = _merge_intervals_total_duration(intervals)
@@ -120,6 +133,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
         occ = float(max(0.0, min(1.0, occ)))
         occupancy_pct[f] = occ
 
+    # Overview windows
     windows = [
         ('30m', timedelta(minutes=30)),
         ('1h', timedelta(hours=1)),
@@ -130,15 +144,18 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
         ('7d', timedelta(days=7)),
         ('30d', timedelta(days=30)),
     ]
-    # "now" in shifted (local) time
+    # "Now" in shifted (local) time
     now_local = datetime.now(timezone.utc) + tz_delta
 
     overview_images: List[Tuple[str,str]] = []
+    window_freqs: Dict[str, List[float]] = {}
     for label, delta in windows:
         t_from = now_local - delta
-        sub = df[df['t_end'] >= t_from].copy()  # overlap with window
+        # Keep segments that overlap the window
+        sub = df[df['t_end'] >= t_from].copy()
+        win_freqs = sorted(sub['freq'].round(3).unique().tolist()) if not sub.empty else []
 
-        # Dynamic height: >=25 px per 1 MHz at 150 DPI
+        # Dynamic height: >=25 px per 1 MHz at 150 DPI, with a baseline height
         dpi = 150
         base_min_px = 600  # 4 inches baseline
         if sub.empty:
@@ -160,8 +177,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
             plt.tight_layout()
         else:
             sub['freq_key'] = sub['freq'].round(3)
-            labeled = set()
-            # Draw in ascending frequency order so legend is sorted
+            # Draw segments per frequency key
             for f in sorted(sub['freq_key'].unique()):
                 freq_rows = sub[sub['freq_key'] == f]
                 for _, row in freq_rows.iterrows():
@@ -169,11 +185,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
                     x1 = min(row['t_end'], now_local)
                     if x1 <= x0:
                         continue
-                    if f not in labeled:
-                        plt.hlines(y=f, xmin=x0, xmax=x1, linewidth=2, color=freq_color.get(f), label=f'{f:.3f} MHz')
-                        labeled.add(f)
-                    else:
-                        plt.hlines(y=f, xmin=x0, xmax=x1, linewidth=2, color=freq_color.get(f))
+                    plt.hlines(y=f, xmin=x0, xmax=x1, linewidth=2, color=freq_color.get(f))
             plt.ylim(ymin, ymax)
             from matplotlib.ticker import FormatStrFormatter
             start_tick = int(np.floor(ymin / 5) * 5)
@@ -184,20 +196,29 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
             plt.xlabel(f'Time ({tz_label})')
             plt.ylabel('Frequency (MHz)')
             plt.xlim(t_from, now_local)
-            n_unique = len(sub['freq_key'].unique())
-            ncol = max(1, min(6, n_unique))
-            plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.18), ncol=ncol, frameon=True)
-            plt.tight_layout(rect=[0, 0.12, 1, 1])
+            # Legend scaffold (labels are not set on lines; keeping structure as-is)
+            handles, labels = plt.gca().get_legend_handles_labels()
+            max_leg = 30
+            if len(labels) > max_leg:
+                extra = len(labels) - max_leg
+                handles = handles[:max_leg]
+                labels = labels[:max_leg] + [f'+{extra} more']
+            plt.legend(handles, labels, loc='center left', bbox_to_anchor=(1.01, 0.5),
+                       frameon=True, fontsize=8, handlelength=2)
+            # Reserve space on the right for the legend
+            plt.tight_layout(rect=[0, 0, 0.78, 1])
         fname = f'overview_{label}.png'
         fig.savefig(out_path / fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
         overview_images.append((label, fname))
+        window_freqs[label] = win_freqs
+    window_map_js = json.dumps(window_freqs)
 
     # --- Weekly heatmaps & tables (shifted time) ---
     heatmap_images: List[Tuple[float,str]] = []
     table_html_map: Dict[float, str] = {}
 
-    # NOTE: table headers reflect shifted tz
+    # Table headers reflect shifted tz
     col_order = ['start_utc','end_utc','freq','samples','pwr_avg','pwr_sd','duty_avg','duty_sd']
     col_rename_display = {
         'start_utc': 'Start (UTC)',
@@ -224,6 +245,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
                 seen.add((cur.date().isoformat(), cur.hour, cur.weekday()))
                 cur = cur + timedelta(hours=1)
 
+        # Heatmap matrix: rows=hour(0-23), cols=weekday(0-6)
         mat = np.zeros((24,7), dtype=int)
         for date_iso, hour, wd in seen:
             if 0 <= hour <= 23 and 0 <= wd <= 6:
@@ -252,7 +274,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
         # ----- Frequency table (shifted Start/End) -----
         # Try to include known columns if present
         cols_exist = [c for c in col_order if c in g.columns]
-        # We'll render Start/End from shifted timestamps regardless
+        # Render Start/End from shifted timestamps
         fmt_time = '%Y-%m-%d %H:%M:%S'
         start_series = g['t_start']
         end_series   = g['t_end']
@@ -283,7 +305,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
     top_tabs_html_parts = []
     for label, fn in overview_images:
         tab_id = f'top_{label}'
-        btn = '<button class="tablink" data-src="{src}" data-target="{tid}">Last {lbl}</button>'.format(src=fn, tid=tab_id, lbl=label)
+        btn = '<button class="tablink" data-window="{lbl}" data-src="{src}" data-target="{tid}">Last {lbl}</button>'.format(src=fn, tid=tab_id, lbl=label)
         top_tabs_html_parts.append(btn)
     top_tabs_html = ' '.join(top_tabs_html_parts)
 
@@ -292,31 +314,31 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
     for f, fn in heatmap_images:
         hexcol = rgba_to_hex(freq_color.get(f, (0.2,0.2,0.2,1.0)))
         tab_id = 'tab_{fid}'.format(fid=str(f).replace('.', '_'))
-        # occupancy
+        # Occupancy
         occ = float(occupancy_pct.get(f, 0.0))
         pct = int(round(occ * 100))
-        # color by threshold
+        # Color by threshold
         if occ < 0.30:
             fill = '#2ecc71'   # green
         elif occ <= 0.70:
             fill = '#f1c40f'   # yellow
         else:
             fill = '#e74c3c'   # red
-        # background gradient to visualize occupancy
+        # Background gradient to visualize occupancy
         bg_style = (
             'background-image: linear-gradient(to right, {fill} {pct}%, #f3f3f3 {pct}%);'
             'background-color: #f3f3f3;'
         ).format(fill=fill, pct=pct)
         title_attr = f'title="Occupancy: {pct}% (from earliest start to latest end)"'
         tabs_html_parts.append(
-            '<button class="tablink occ" data-target="{tid}" style="border-bottom: 3px solid {col}; {bg}" {title}>{txt}</button>'.format(
-                tid=tab_id, col=hexcol, bg=bg_style, title=title_attr, txt=f"{f:.3f} MHz"
+            '<button class="tablink occ freq-tab" data-freq="{txt_raw}" data-target="{tid}" style="border-bottom: 3px solid {col}; {bg}" {title}>{txt}</button>'.format(
+                tid=tab_id, col=hexcol, bg=bg_style, title=title_attr, txt=f"{f:.3f} MHz", txt_raw=f"{f:.3f}"
             )
         )
-        # content
+        # Content block
         block = []
-        block.append('<div class="tabcontent" id="{tid}" style="display:none">'.format(tid=tab_id))
-        block.append('  <h3 style="color:{col}">{txt} — Occupancy: {pct}%</h3>'.format(col=hexcol, txt=f"{f:.3f} MHz", pct=pct))
+        block.append('<div class="tabcontent" data-freq="{freq}" id="{tid}" style="display:none">'.format(freq=f"{f:.3f}", tid=tab_id))
+        block.append('  <h3 style="color:{col}">{txt} — Occupancy: {pct}%</h3>'.format(col=hexcol, txt=f"{f:.3f} MHz", txt_raw=f"{f:.3f}", pct=pct))
         block.append('  <img src="{src}" style="max-width:50%; height:auto;"/>'.format(src=fn))
         block.append('  <div class="table-wrap">')
         block.append(table_html_map.get(f, '<p>No data</p>'))
@@ -326,6 +348,7 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
     tabs_html = '\n'.join(tabs_html_parts)
     tabcontent_html = '\n'.join(content_html_parts)
 
+    # HTML assembly
     html_head = []
     html_head.append('<!DOCTYPE html>')
     html_head.append('<html lang="en">')
@@ -363,22 +386,56 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
     html_head.append('__TABS__')
     html_head.append('</div>')
     html_head.append('__TABCONTENTS__')
+    # --- Script (only order change + one line: use activateTab instead of click) ---
     html_head.append('<script>')
-    html_head.append('const img = document.getElementById(\'overviewImg\');')
-    html_head.append('// Top tabs')
-    html_head.append('const topTabs = document.querySelectorAll(\'#topTabs .tablink\');')
-    html_head.append('function activateTop(btn){ topTabs.forEach(b => b.classList.toggle(\'active\', b===btn)); img.src = btn.dataset.src; }')
-    html_head.append('if (topTabs.length > 0) { activateTop(topTabs[Math.max(0, topTabs.length-3)]); }')
-    html_head.append('// Attach click listeners for top tabs')
-    html_head.append('for (const b of topTabs) { b.addEventListener(\'click\', () => activateTop(b)); }')
-    html_head.append('// Bottom tabs')
-    html_head.append('const links = document.querySelectorAll(\'.tabbar .tablink\');')
-    html_head.append('const contents = document.querySelectorAll(\'.tabcontent\');')
-    html_head.append('function activateTab(targetId) { contents.forEach(c => c.style.display = (c.id === targetId ? \'block\' : \'none\')); links.forEach(l => l.classList.toggle(\'active\', l.dataset.target === targetId)); }')
-    html_head.append('const bottomTabs = Array.from(links).filter(l => l.dataset.target && l.closest(\'#topTabs\') === null);')
-    html_head.append('if (bottomTabs.length > 0) { activateTab(bottomTabs[0].dataset.target); }')
-    html_head.append('bottomTabs.forEach(l => l.addEventListener(\'click\', () => activateTab(l.dataset.target)));')
+    html_head.append("const img = document.getElementById('overviewImg');")
+    html_head.append('const windowMap = __WINDOW_MAP__;')
+    # Bottom tabs FIRST (so they are available when filter/activateTop run)
+    html_head.append("const links = document.querySelectorAll('.tabbar .tablink');")
+    html_head.append("const contents = document.querySelectorAll('.tabcontent');")
+    html_head.append('function activateTab(targetId) {')
+    html_head.append("  contents.forEach(c => c.style.display = (c.id === targetId ? 'block' : 'none'));")
+    html_head.append("  links.forEach(l => l.classList.toggle('active', l.dataset.target === targetId));")
+    html_head.append('}')
+    html_head.append("const bottomTabs = Array.from(links).filter(l => l.dataset.target && l.closest('#topTabs') === null);")
+    html_head.append('bottomTabs.forEach(l => { l.addEventListener("click", () => activateTab(l.dataset.target)); });')
+
+    # Filter function
+    html_head.append('// Filter bottom frequency tabs to those present in the selected window;')
+    html_head.append('// if the window has no frequencies, hide all bottom tabs.')
+    html_head.append('function filterBottomTabs(win){')
+    html_head.append('  const allow = new Set((windowMap[win] || []).map(x => Number(x).toFixed(3)));')
+    html_head.append('  const hasAllow = allow.size > 0;')
+    html_head.append('  const tabs = document.querySelectorAll(".freq-tab");')
+    html_head.append('  const allContents = document.querySelectorAll(".tabcontent");')
+    html_head.append('  tabs.forEach(t => {')
+    html_head.append('    const show = hasAllow ? allow.has((t.dataset.freq || "")) : false;')
+    html_head.append('    t.style.display = show ? "inline-block" : "none";')
+    html_head.append('  });')
+    html_head.append('  allContents.forEach(c => {')
+    html_head.append('    const show = hasAllow ? allow.has((c.dataset.freq || "")) : false;')
+    html_head.append('    if (!show) c.style.display = "none";')
+    html_head.append('  });')
+    html_head.append('  const firstVisible = Array.from(tabs).find(t => t.style.display !== "none");')
+    html_head.append('  if (firstVisible) { activateTab(firstVisible.dataset.target); }')  # <-- changed line
+    html_head.append('}')
+
+    # Top tabs
+    html_head.append("const topTabs = document.querySelectorAll('#topTabs .tablink');")
+    html_head.append('function activateTop(btn){')
+    html_head.append('  topTabs.forEach(b => b.classList.toggle("active", b === btn));')
+    html_head.append('  img.src = btn.dataset.src;')
+    html_head.append('  filterBottomTabs(btn.dataset.window);')
+    html_head.append('}')
+    html_head.append('if (topTabs.length > 0) {')
+    html_head.append('  const initIdx = Math.max(0, topTabs.length - 3);')
+    html_head.append('  activateTop(topTabs[initIdx]);')
+    html_head.append('}')
+    html_head.append('for (const b of topTabs) {')
+    html_head.append('  b.addEventListener("click", () => activateTop(b));')
+    html_head.append('}')
     html_head.append('</script>')
+    # --- End script ---
     html_head.append('</body>')
     html_head.append('</html>')
     html = '\n'.join(html_head)
@@ -386,12 +443,14 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
     html = html.replace('__INIT_SRC__', (overview_images[-1][1] if overview_images else ''))
     html = html.replace('__TABS__', tabs_html)
     html = html.replace('__TABCONTENTS__', tabcontent_html)
-    html_path.write_text(html, encoding='utf-8')
-    print(f'[i] Report generated: {html_path}')
+    html = html.replace('__WINDOW_MAP__', window_map_js)
+
+    # Single write and single log line
     html_path.write_text(html, encoding='utf-8')
     print(f'[i] Report generated: {html_path}')
 
 def _parse_args():
+    """CLI argument parser."""
     ap = argparse.ArgumentParser(description="Generate spectrum occupancy report with optional time-zone hour offset.")
     ap.add_argument("--input-csv", default="aggregated_signals.csv", help="Input aggregated CSV (default: aggregated_signals.csv)")
     ap.add_argument("--out-dir", default="report", help="Output directory for HTML and images (default: report)")
@@ -402,4 +461,10 @@ def _parse_args():
 
 if __name__ == '__main__':
     args = _parse_args()
-    build_report(input_csv=args.input_csv, out_dir=args.out_dir, tz_offset_hours=args.tz_offset)
+    build_report(
+        input_csv=args.input_csv,
+        out_dir=args.out_dir,
+        tz_offset_hours=args.tz_offset,
+        f_start=args.f_start,
+        f_stop=args.f_stop
+    )
