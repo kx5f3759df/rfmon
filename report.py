@@ -80,6 +80,10 @@ def build_report(input_csv: str = 'aggregated_signals.csv',
     if not csv_path.exists():
         raise FileNotFoundError(f'File not found: {input_csv}. Please generate it first.')
     df = pd.read_csv(csv_path)
+    if args.f_start is not None:
+        df = df[df["freq"] >= args.f_start]
+    if args.f_stop is not None:
+        df = df[df["freq"] <= args.f_stop]
     req = ['start_utc', 'end_utc', 'freq']
     for col in req:
         if col not in df.columns:
@@ -392,6 +396,8 @@ def _parse_args():
     ap.add_argument("--input-csv", default="aggregated_signals.csv", help="Input aggregated CSV (default: aggregated_signals.csv)")
     ap.add_argument("--out-dir", default="report", help="Output directory for HTML and images (default: report)")
     ap.add_argument("--tz-offset", type=int, default=0, help="Hour offset from UTC, e.g., +8 for UTC+8, -12 for UTC-12 (default: 0)")
+    ap.add_argument("--f-start", type=float, default=None, help="Lower bound frequency in MHz")
+    ap.add_argument("--f-stop", type=float, default=None, help="Upper bound frequency in MHz")
     return ap.parse_args()
 
 if __name__ == '__main__':

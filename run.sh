@@ -30,7 +30,7 @@ CMD1=(
 CMD2=(
   "python3 rfmon_v2.py --f-start 400 --f-stop 520 --samp 2 --dwell 1 --gain 20 --overlap 10 --auto-threshold 16"
   "python3 -m http.server 8000 --directory report"
-  "python3 aggr.py && python3 report.py --tz-offset 8"
+  "python3 aggr.py && python3 report.py --tz-offset 8 --f-start 439.5 --f-stop 450.5"
 )
 
 # 第二个命令的重试/重跑延迟（秒）
