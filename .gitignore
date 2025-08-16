@@ -1,4 +1,6 @@
 *.csv
+stats.json
+report/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
