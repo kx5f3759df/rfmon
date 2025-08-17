@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Waterfall Viewer — offline (v5)</title>
+<style>
+  :root { color-scheme: dark light; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Helvetica, Arial; background:#0b0e13; color:#e5e7eb; }
+  header { position:sticky; top:0; z-index:10; background:rgba(11,14,19,.96); border-bottom:1px solid #1f2937; padding:10px 12px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px 12px; align-items:center; }
+  label { font-size: 13px; color:#cbd5e1; }
+  select, input, button { background:#111827; color:#e5e7eb; border:1px solid #374151; border-radius:10px; padding:6px 8px; }
+  input[type="number"]{ width: 90px; }
+  button { cursor:pointer; }
+  #stage { display:grid; grid-template-columns: 1fr auto; column-gap:8px; align-items:stretch; }
+  #canvas { width:100%; height:60vh; min-height:420px; display:block; background:#0b0e13; }
+  #legend { width:18px; height:60vh; min-height:420px; display:block; border-left:1px solid #1f2937; }
+  #status { font-size:12px; color:#9ca3af; border-top:1px solid #1f2937; padding:6px 12px; min-height:20px; }
+  .sep { width:1px; height:20px; background:#374151; margin:0 6px; }
+  .hint { font-size:12px; color:#9ca3af; }
+  code { color:#a5b4fc; }
+  #tooltip{
+    position:fixed; pointer-events:none; z-index:20;
+    background:#111827; color:#e5e7eb; border:1px solid #374151;
+    border-radius:10px; padding:8px 10px; font-size:12px; max-width: 50vw;
+    box-shadow: 0 4px 20px rgba(0,0,0,.35);
+    display:none;
+  }
+  #rubber{ position:fixed; border:1px dashed #60a5fa; background:rgba(96,165,250,.15); pointer-events:none; display:none; z-index:15; }
+  /* Heatmap table */
+  #heatmapBox{ padding:10px 12px; border-top:1px solid #1f2937; }
+  #heatmapBox h3{ margin:6px 0 10px; font-weight:600; }
+  table.hm{ border-collapse:collapse; width:100%; max-width:100%; }
+  table.hm th, table.hm td{ border:1px solid #303643; padding:4px 6px; text-align:center; font-size:12px; }
+  table.hm th{ background:#0f172a; color:#cbd5e1; position:sticky; top:0; }
+  .cell{ min-width:34px; }
+  .hmLegend{ font-size:12px; color:#9ca3af; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <label>Time X: <select id="xStart"></select> – <select id="xEnd"></select></label>
+    <label>Frequency Y: <select id="yFreq"></select></label>
+    <label>Color by: <select id="colorBy"></select></label>
+    <label>Colormap: 
+      <select id="cmap">
+        <option selected>viridis</option>
+        <option>turbo</option>
+        <option>plasma</option>
+      </select>
+    </label>
+    <label>Freq bin (kHz): <input type="number" id="binKhz" value="12.5" step="0.5" /></label>
+    <label>Track thickness (px): <input type="number" id="trackPx" value="0" step="1" /></label>
+    <label>Stroke (px): <input type="number" id="strokePx" value="0" step="0.5" /></label>
+    <label>UTC offset (h): <input type="number" id="tzOffset" value="0" step="1" /></label>
+    <label><input type="checkbox" id="autoScale" checked> Auto color scale</label>
+    <label>Min: <input type="number" id="vMin" step="0.1" value="-120"></label>
+    <label>Max: <input type="number" id="vMax" step="0.1" value="-20"></label>
+    <label>Apply threshold: <input type="checkbox" id="applyThr"></label>
+    <label>Threshold: <input type="number" id="thr" step="0.1" value="0"></label>
+    <label>Min duration (s): <input type="number" id="minDur" step="0.1" value="0"></label>
+    <div class="sep"></div>
+    <button id="boxZoomBtn" title="Drag on canvas to box-zoom">Box Zoom</button>
+    <button id="exportBtn" title="Export visible view as PNG">Export PNG</button>
+    <button id="resetBtn">Reset View</button>
+    <input type="file" id="fileInput" accept=".csv" />
+    <span class="hint">Wheel=zoom X · Shift+Wheel=zoom Y · Drag=pan · Click a track to render weekly heatmap below</span>
+  </div>
+</header>
+
+<div id="stage">
+  <canvas id="canvas"></canvas>
+  <canvas id="legend"></canvas>
+</div>
+<div id="status">Ready.</div>
+<div id="tooltip"></div>
+<div id="rubber"></div>
+
+<div id="heatmapBox">
+  <h3 id="hmTitle">Weekly activity heatmap (click a track above)</h3>
+  <div id="hmTableWrap"></div>
+  <div class="hmLegend" id="hmLegend"></div>
+</div>
+
+<script>
+window.addEventListener('error', (e)=>{
+  const s=document.getElementById('status');
+  s.textContent = 'Error: ' + (e.message || e.error);
+});
+function safe(fn){ try{ return fn(); }catch(err){ const s=document.getElementById('status'); s.textContent='Error: '+err; console.error(err); } }
+
+function parseCSV(text){
+  const rows=[]; let i=0,cur="",row=[],inQ=false;
+  const pushCell=()=>{ row.push(cur); cur=""; };
+  const pushRow=()=>{ rows.push(row); row=[]; };
+  while(i<text.length){
+    const c=text[i++];
+    if(inQ){
+      if(c==='\"'){ if(text[i]==='\"'){ cur+='\"'; i++; } else inQ=false; } else cur+=c;
+    } else {
+      if(c==='\"') inQ=true;
+      else if(c===','){ pushCell(); }
+      else if(c==='\n'){ pushCell(); pushRow(); }
+      else if(c==='\r'){}
+      else cur+=c;
+    }
+  }
+  if(cur.length>0 || row.length>0){ pushCell(); pushRow(); }
+  if(rows.length===0) return {columns:[], data:[]};
+  const columns = rows.shift().map(s=>s.trim());
+  const data = rows.filter(r=>r.length===columns.length).map(r=>{
+    const o={}; for(let j=0;j<columns.length;j++) o[columns[j]]=r[j]; return o;
+  });
+  return {columns, data};
+}
+function num(v){ const n=Number(v); return isNaN(n)? null:n; }
+
+// Colormaps
+function viridis(t){ t = Math.min(1, Math.max(0, t)); const r=Math.round(255*(0.2803+0.2258*t-1.8495*t*t+1.7283*t*t*t));const g=Math.round(255*(0.0019+1.0387*t-0.7272*t*t+0.1197*t*t*t));const b=Math.round(255*(0.2867+0.4706*t+0.3808*t*t-1.1371*t*t*t)); return `rgb(${r},${g},${b})`; }
+function turbo(t){ t=Math.min(1,Math.max(0,t)); const a=[0.1357, 4.6154, -42.6607, 132.1319, -152.9423, 59.2862]; const b=[0.0912, 2.1941, 4.8426, -14.1851, 4.2774, 2.8296]; const c=[0.1067, -3.4416, 32.7247, -95.8136, 102.6940, -36.3871]; const p=(co)=>{return Math.max(0, Math.min(255, Math.round(255*(co[0]+co[1]*t+co[2]*t**2+co[3]*t**3+co[4]*t**4+co[5]*t**5))))}; return `rgb(${p(a)},${p(b)},${p(c)})`; }
+function plasma(t){ t=Math.min(1,Math.max(0,t)); const r=Math.round(255*(0.0500+2.388*t-4.239*t*t+3.098*t**3-0.696*t**4)); const g=Math.round(255*(0.0290+0.699*t+0.440*t**2-1.019*t**3+0.403*t**4)); const b=Math.round(255*(0.5270-1.907*t+3.050*t**2-1.531*t**3+0.250*t**4)); return `rgb(${r},${g},${b})`; }
+function pickCmap(name){ return name==='turbo'? turbo : (name==='plasma'? plasma : viridis); }
+
+function drawLegend(vmin,vmax, cmapName){
+  const lg=document.getElementById('legend');
+  const ctx=lg.getContext('2d');
+  const w=lg.width=lg.clientWidth, h=lg.height=lg.clientHeight;
+  const map=pickCmap(cmapName);
+  const grd=ctx.createLinearGradient(0,h,0,0);
+  for(let i=0;i<=100;i++){ grd.addColorStop(i/100, map(i/100)); }
+  ctx.fillStyle=grd; ctx.fillRect(0,0,w,h);
+  ctx.fillStyle="#cbd5e1"; ctx.font="12px system-ui";
+  ctx.textAlign="left"; ctx.textBaseline="top"; ctx.fillText(String(vmin), 2, 2);
+  ctx.textBaseline="bottom"; ctx.fillText(String(vmax), 2, h-2);
+}
+
+// globals
+let COLUMNS=[], ROWS=[];
+let startCol=null, endCol=null, freqCol=null, valCol=null;
+let tzOffsetHours = 0;
+let view = { t0:0, t1:1, f0:0, f1:1 };
+const canvas=document.getElementById('canvas');
+const ctx=canvas.getContext('2d');
+const tooltip=document.getElementById('tooltip');
+const rubber=document.getElementById('rubber');
+const statusEl=document.getElementById('status');
+let DATA=[], LAST_RECTS=[];
+let boxZoomMode=false, boxStart=null, boxEnd=null;
+
+// UI refs
+const xStartSel=document.getElementById('xStart');
+const xEndSel=document.getElementById('xEnd');
+const yFreqSel=document.getElementById('yFreq');
+const colorBySel=document.getElementById('colorBy');
+const cmapSel=document.getElementById('cmap');
+const binKhzInput=document.getElementById('binKhz');
+const trackPxInput=document.getElementById('trackPx');
+const strokePxInput=document.getElementById('strokePx');
+const tzInput=document.getElementById('tzOffset');
+const autoScale=document.getElementById('autoScale');
+const vMinInput=document.getElementById('vMin');
+const vMaxInput=document.getElementById('vMax');
+const applyThr=document.getElementById('applyThr');
+const thrInput=document.getElementById('thr');
+const minDurInput=document.getElementById('minDur');
+const resetBtn=document.getElementById('resetBtn');
+const boxZoomBtn=document.getElementById('boxZoomBtn');
+const exportBtn=document.getElementById('exportBtn');
+
+const hmTitle=document.getElementById('hmTitle');
+const hmWrap=document.getElementById('hmTableWrap');
+const hmLegend=document.getElementById('hmLegend');
+
+function guessColumns(){
+  const low = COLUMNS.map(c=>c.toLowerCase());
+  const findName = (arr)=>{ for(const key of arr){ const i=low.findIndex(n=>n.includes(key)); if(i>=0) return COLUMNS[i]; } return null; };
+  const s = findName(["start_utc","start","begin","time"]);
+  const e = findName(["end_utc","end","stop"]);
+  const f = findName(["freq","mhz","khz","hz","center"]);
+  let v = findName(["duty_avg","duty","occup","util","power","pwr_avg","db","rssi"]);
+  startCol = s || COLUMNS[0];
+  endCol   = e || COLUMNS[1] || startCol;
+  freqCol  = f || COLUMNS[2] || COLUMNS[0];
+  valCol   = v || COLUMNS.find(c=>c!==startCol && c!==endCol && c!==freqCol) || COLUMNS[3] || COLUMNS[0];
+
+  xStartSel.innerHTML = COLUMNS.map(n=>`<option ${n===startCol?'selected':''}>${n}</option>`).join('');
+  xEndSel.innerHTML   = COLUMNS.map(n=>`<option ${n===endCol?'selected':''}>${n}</option>`).join('');
+  yFreqSel.innerHTML  = COLUMNS.map(n=>`<option ${n===freqCol?'selected':''}>${n}</option>`).join('');
+  colorBySel.innerHTML= COLUMNS.map(n=>`<option ${n===valCol?'selected':''}>${n}</option>`).join('');
+}
+
+function prepare(){
+  const getMs = (v)=>{
+    if(v==null||v==="") return null;
+    const s=String(v).trim();
+    if(/^-?\d+(\.\d+)?$/.test(s)){
+      const num=+s; return (num>1e12? num : (num>1e9? num*1000 : num));
+    }
+    const t=Date.parse(s); return isNaN(t)? null : t;
+  };
+  const S = ROWS.map(r=>getMs(r[startCol]));
+  const E = ROWS.map(r=>getMs(r[endCol]));
+  const F = ROWS.map(r=>num(r[freqCol]));
+  const V = ROWS.map(r=>num(r[valCol]));
+
+  const pts=[];
+  for(let i=0;i<ROWS.length;i++){
+    const s=S[i], e=E[i], f=F[i], v=V[i];
+    if(s==null||e==null||f==null||v==null) continue;
+    const t0=Math.min(s,e), t1=Math.max(s,e);
+    const dur = (t1-t0)/1000;
+    pts.push({t0,t1,f,v,dur,raw:ROWS[i]});
+  }
+  pts.sort((a,b)=>a.t0-b.t0);
+  DATA = pts;
+
+  if(DATA.length){
+    view.t0 = DATA[0].t0;
+    view.t1 = DATA[DATA.length-1].t1;
+    let fmin=Infinity,fmax=-Infinity;
+    for(const p of DATA){ if(p.f<fmin) fmin=p.f; if(p.f>fmax) fmax=p.f; }
+    view.f0=fmin; view.f1=fmax;
+  }
+  // Guess bin
+  let uniq=[]; for(const p of DATA){ if(!uniq.length || uniq[uniq.length-1]!==p.f) uniq.push(p.f); }
+  uniq.sort((a,b)=>a-b);
+  let minStep=Infinity; for(let i=1;i<uniq.length;i++){ const d=uniq[i]-uniq[i-1]; if(d>0 && d<minStep) minStep=d; }
+  if(isFinite(minStep)){
+    const khz = Math.max(1, Math.round(minStep*1000));
+    if(!binKhzInput.dataset.locked) binKhzInput.value = String(khz);
+  }
+  if(autoScale.checked){
+    let vmin=Infinity,vmax=-Infinity;
+    for(const p of DATA){ if(p.v<vmin) vmin=p.v; if(p.v>vmax) vmax=p.v; }
+    if(isFinite(vmin)&&isFinite(vmax)){ vMinInput.value=vmin.toFixed(2); vMaxInput.value=vmax.toFixed(2); }
+  }
+  draw();
+}
+
+function resizeCanvas(){
+  const dpr = Math.max(1, window.devicePixelRatio||1);
+  const w = canvas.clientWidth, h=canvas.clientHeight;
+  canvas.width = Math.max(1, Math.floor(w*dpr));
+  canvas.height= Math.max(1, Math.floor(h*dpr));
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  drawLegend(Number(vMinInput.value), Number(vMaxInput.value), cmapSel.value);
+}
+
+function tToX(t){ const padL=60, padR=20, w=canvas.clientWidth - padL - padR; return padL + (t - view.t0) * (w / (view.t1 - view.t0)); }
+function fToY(f){ const padT=16, padB=60, h=canvas.clientHeight - padT - padB; const ratio = (f - view.f0) / (view.f1 - view.f0); return padT + (1 - ratio) * h; }
+
+function drawAxes(){
+  const w=canvas.clientWidth, h=canvas.clientHeight;
+  const padL=60, padR=20, padT=16, padB=60;
+  ctx.save();
+  ctx.strokeStyle='#2a2f3a'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(padL,padT); ctx.lineTo(padL,h-padB); ctx.lineTo(w-padR,h-padB); ctx.stroke();
+
+  const tickCountX = Math.max(2, Math.floor(w/140));
+  const tickCountY = Math.max(2, Math.floor(h/80));
+  const spanT = view.t1 - view.t0;
+  const stepChoices=[1e3,2e3,5e3,10e3,30e3,60e3,2*60e3,5*60e3,10*60e3,30*60e3,3600e3,2*3600e3,6*3600e3,12*3600e3,24*3600e3,2*24*3600e3,7*24*3600e3,30*24*3600e3];
+  let stepT=stepChoices[0];
+  for(const s of stepChoices){ stepT=s; if(spanT/(tickCountX*s)<=1) break; }
+  const startT = Math.ceil(view.t0/stepT)*stepT;
+  ctx.fillStyle='#9ca3af'; ctx.font='12px system-ui'; ctx.textAlign='center'; ctx.textBaseline='top';
+  for(let t=startT; t<=view.t1; t+=stepT){
+    const x=tToX(t);
+    ctx.strokeStyle='#1f2937'; ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,h-padB); ctx.stroke();
+    const d=new Date(t + tzOffsetHours*3600*1000);
+    const label=d.toISOString().replace('T',' ').replace(/\.\d+Z$/,'').slice(5,16);
+    const tx=Math.min(Math.max(x, 60+16), w-20-16);
+    ctx.fillText(label, tx, h-padB+6);
+  }
+  const spanF = view.f1 - view.f0;
+  const stepFChoices=[0.001,0.002,0.005,0.01,0.02,0.05,0.1,0.2,0.5,1,2,5];
+  let stepF=stepFChoices[0];
+  for(const s of stepFChoices){ stepF=s; if(spanF/(tickCountY*s)<=1) break; }
+  const startF = Math.ceil(view.f0/stepF)*stepF;
+  ctx.textAlign='right'; ctx.textBaseline='middle';
+  for(let f=startF; f<=view.f1+1e-9; f+=stepF){
+    const y=fToY(f);
+    ctx.strokeStyle='#1f2937'; ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
+    ctx.fillStyle='#9ca3af'; ctx.fillText(f.toFixed(stepF>=1?0: stepF>=0.1?1:3), padL-4, y);
+  }
+  ctx.fillStyle='#cbd5e1'; ctx.textAlign='center'; ctx.textBaseline='bottom';
+  ctx.fillText(`Time (UTC${tzOffsetHours>=0?'+':''}${tzOffsetHours}h)`, (w-padL-padR)/2+padL, h-4);
+  ctx.save(); ctx.translate(14, (h-padT-padB)/2+padT); ctx.rotate(-Math.PI/2);
+  ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillText('Frequency (MHz)', 0, 0); ctx.restore();
+  ctx.restore();
+}
+
+let LAST_FREQ_CLICKED=null;
+
+function drawWaterfall(){
+  if(!DATA.length) return;
+  const vmin=Number(vMinInput.value), vmax=Number(vMaxInput.value);
+  const binKhz = Number(binKhzInput.value)||12.5;
+  const binMHz = binKhz/1000;
+  const trackPx = Number(trackPxInput.value)||0;
+  const strokePx = Number(strokePxInput.value)||0;
+  const apply = applyThr.checked;
+  const thr = Number(thrInput.value)||0;
+  const minDur = Number(minDurInput.value)||0;
+  const map = pickCmap(cmapSel.value);
+
+  LAST_RECTS.length = 0;
+  ctx.save();
+  for(let i=0;i<DATA.length;i++){
+    const p=DATA[i];
+    if(p.t1<view.t0 || p.t0>view.t1) continue;
+    if(p.f<Math.min(view.f0,view.f1)-binMHz || p.f>Math.max(view.f0,view.f1)+binMHz) continue;
+    if(apply && !(p.v>=thr)) continue;
+    if(minDur>0 && p.dur<minDur) continue;
+
+    let x0=tToX(Math.max(p.t0, view.t0));
+    let x1=tToX(Math.min(p.t1, view.t1));
+    let yTop = fToY(p.f + binMHz/2), yBot = fToY(p.f - binMHz/2);
+    let y0=Math.min(yTop,yBot), y1=Math.max(yTop,yBot);
+    if(trackPx>0){ const cy=(y0+y1)/2; y0 = cy - trackPx/2; y1 = cy + trackPx/2; }
+    const ww=Math.max(1, x1-x0);
+    const hh=Math.max(1, y1-y0);
+    const t=(p.v - vmin)/(vmax - vmin);
+
+    // highlight if same freq as last clicked
+    if(LAST_FREQ_CLICKED!=null && Math.abs(p.f - LAST_FREQ_CLICKED) <= binMHz/2){
+      ctx.globalAlpha = 1.0;
+    }else{
+      ctx.globalAlpha = 0.9;
+    }
+    ctx.fillStyle = map(t);
+    ctx.fillRect(Math.floor(x0), Math.floor(y0), Math.ceil(ww), Math.ceil(hh));
+    if(strokePx>0){
+      ctx.lineWidth = strokePx;
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      ctx.strokeRect(Math.floor(x0)+.5, Math.floor(y0)+.5, Math.ceil(ww)-1, Math.ceil(hh)-1);
+    }
+    LAST_RECTS.push({x0:x0, y0:y0, x1:x1, y1:y1, data:p});
+  }
+  ctx.globalAlpha=1.0;
+  ctx.restore();
+}
+
+function draw(){
+  resizeCanvas();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  drawAxes();
+  drawWaterfall();
+}
+
+// ===== Weekly heatmap table =====
+function buildWeeklyTableForFreq(targetFreq){
+  LAST_FREQ_CLICKED = targetFreq; // for highlight
+  draw(); // refresh highlight
+
+  const binKhz = Number(binKhzInput.value)||12.5;
+  const binMHz = binKhz/1000;
+  const rows = []; // 24 x 7 values (counts of unique days)
+  for(let h=0; h<24; h++){ rows[h]=new Array(7).fill(0); }
+
+  // We use sets to count unique calendar days per cell
+  const sets = []; for(let h=0; h<24; h++){ sets[h]=new Array(7); for(let d=0; d<7; d++) sets[h][d]=new Set(); }
+
+  function localDateStr(ms){
+    const d = new Date(ms + tzOffsetHours*3600*1000);
+    return d.getUTCFullYear()+"-"+String(d.getUTCMonth()+1).padStart(2,'0')+"-"+String(d.getUTCDate()).padStart(2,'0');
+  }
+  function weekday(ms){
+    const d = new Date(ms + tzOffsetHours*3600*1000);
+    return d.getUTCDay(); // 0..6, Sun=0
+  }
+  function hour(ms){
+    const d = new Date(ms + tzOffsetHours*3600*1000);
+    return d.getUTCHours();
+  }
+
+  // Iterate all events close to that freq
+  const related = DATA.filter(p => Math.abs(p.f - targetFreq) <= binMHz/2);
+  for(const p of related){
+    // For each hour bucket intersecting [t0,t1], mark the weekday/hour with the date string
+    // Approximate by stepping through every hour boundary between floor(t0) and ceil(t1)
+    const start = Math.floor(p.t0/3600000)*3600000;
+    const end = Math.ceil(p.t1/3600000)*3600000;
+    for(let t=start; t<=end; t+=3600000){
+      // consider bucket [t, t+1h)
+      const overlap = Math.max(0, Math.min(p.t1, t+3600000) - Math.max(p.t0, t));
+      if(overlap<=0) continue;
+      const wd = (weekday(t)+6)%7; // convert to Mon=0..Sun=6
+      const hr = hour(t);
+      sets[hr][wd].add(localDateStr(t));
+    }
+  }
+
+  // Compute counts and max
+  let maxCount = 0, totalActiveCells=0;
+  for(let h=0; h<24; h++){
+    for(let d=0; d<7; d++){
+      const c = sets[h][d].size; rows[h][d]=c;
+      if(c>0) totalActiveCells++;
+      if(c>maxCount) maxCount=c;
+    }
+  }
+
+  // Build table
+  const weekdays = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+  let html = '<table class="hm"><thead><tr><th>Hour</th>';
+  for(const w of weekdays) html += `<th>${w}</th>`;
+  html += '</tr></thead><tbody>';
+  for(let h=0; h<24; h++){
+    html += `<tr><th>${h}</th>`;
+    for(let d=0; d<7; d++){
+      const val = rows[h][d];
+      const ratio = maxCount>0? (val/maxCount) : 0;
+      const bg = `rgba(99, 102, 241, ${0.08 + 0.72*ratio})`; // indigo alpha based
+      html += `<td class="cell" title="${val} unique day(s)" style="background:${bg}">${val>0? val: ''}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  hmWrap.innerHTML = html;
+  hmTitle.textContent = `${targetFreq.toFixed(3)} MHz — Weekly activity heatmap`;
+  hmLegend.textContent = `Cell value = number of unique days with activity in that hour (Mon=0 … Sun=6, UTC${tzOffsetHours>=0?'+':''}${tzOffsetHours}).`;
+}
+
+// Interactions
+canvas.addEventListener('wheel',(e)=>{
+  e.preventDefault();
+  if(!DATA.length) return;
+  const rect=canvas.getBoundingClientRect();
+  const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+  const xRatio = (mx-60)/(canvas.clientWidth-60-20);
+  const yRatio = 1 - (my-16)/(canvas.clientHeight-16-60);
+  const zoom = Math.exp((e.deltaY>0?1:-1)*0.1);
+  if(e.shiftKey){
+    const fC = view.f0 + (view.f1-view.f0)*yRatio;
+    const f0 = fC - (fC - view.f0)/zoom;
+    const f1 = fC + (view.f1 - fC)/zoom;
+    view.f0=f0; view.f1=f1;
+  }else{
+    const tC = view.t0 + (view.t1-view.t0)*xRatio;
+    const t0 = tC - (tC - view.t0)/zoom;
+    const t1 = tC + (view.t1 - tC)/zoom;
+    view.t0=t0; view.t1=t1;
+  }
+  draw();
+},{passive:false});
+
+let dragging=false, lastXmove=0, lastYmove=0;
+canvas.addEventListener('mousedown',(e)=>{
+  if(boxZoomMode){
+    boxStart={x:e.clientX, y:e.clientY}; boxEnd=null;
+    rubber.style.left = boxStart.x+'px'; rubber.style.top = boxStart.y+'px';
+    rubber.style.width='0px'; rubber.style.height='0px'; rubber.style.display='block';
+  }else{
+    dragging=true; lastXmove=e.clientX; lastYmove=e.clientY; tooltip.style.display='none';
+  }
+});
+window.addEventListener('mouseup',()=>{
+  if(boxZoomMode && boxStart && boxEnd){
+    const rect=canvas.getBoundingClientRect();
+    const ax0=60, ax1=canvas.clientWidth-20, ay0=16, ay1=canvas.clientHeight-60;
+    const xA = Math.min(Math.max(boxStart.x-rect.left, ax0), ax1);
+    const yA = Math.min(Math.max(boxStart.y-rect.top, ay0), ay1);
+    const xB = Math.min(Math.max(boxEnd.x-rect.left, ax0), ax1);
+    const yB = Math.min(Math.max(boxEnd.y-rect.top, ay0), ay1);
+    const x0D = view.t0 + (view.t1-view.t0)*(xA-ax0)/(ax1-ax0);
+    const x1D = view.t0 + (view.t1-view.t0)*(xB-ax0)/(ax1-ax0);
+    const y0D = view.f1 - (view.f1-view.f0)*(yA-ay0)/(ay1-ay0);
+    const y1D = view.f1 - (view.f1-view.f0)*(yB-ay0)/(ay1-ay0);
+    view.t0=Math.min(x0D,x1D); view.t1=Math.max(x0D,x1D);
+    view.f0=Math.min(y0D,y1D); view.f1=Math.max(y0D,y1D);
+    rubber.style.display='none';
+    boxStart=null; boxEnd=null; boxZoomMode=false; boxZoomBtn.classList.remove('active');
+    draw();
+  }
+  dragging=false;
+});
+window.addEventListener('mousemove',(e)=>{
+  if(boxZoomMode && boxStart){
+    boxEnd={x:e.clientX, y:e.clientY};
+    const x=Math.min(boxStart.x, boxEnd.x), y=Math.min(boxStart.y, boxEnd.y);
+    const w=Math.abs(boxStart.x-boxEnd.x), h=Math.abs(boxStart.y-boxEnd.y);
+    rubber.style.left=x+'px'; rubber.style.top=y+'px'; rubber.style.width=w+'px'; rubber.style.height=h+'px';
+    return;
+  }
+  const rect=canvas.getBoundingClientRect();
+  const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+  if(dragging){
+    const dx=e.clientX-lastXmove, dy=e.clientY-lastYmove;
+    lastXmove=e.clientX; lastYmove=e.clientY;
+    const xScale=(view.t1-view.t0)/(canvas.clientWidth-60-20);
+    const yScale=(view.f1-view.f0)/(canvas.clientHeight-16-60);
+    view.t0 -= dx*xScale; view.t1 -= dx*xScale;
+    view.f0 += dy*yScale; view.f1 += dy*yScale;
+    draw();
+    tooltip.style.display='none';
+    return;
+  }
+  // Hover
+  let hit=null;
+  for(let i=LAST_RECTS.length-1;i>=0;i--){
+    const r=LAST_RECTS[i];
+    if(mx>=r.x0 && mx<=r.x1 && my>=r.y0 && my<=r.y1){ hit=r; break; }
+  }
+  if(!hit){ tooltip.style.display='none'; return; }
+  const p=hit.data;
+  const d0=new Date(p.t0 + tzOffsetHours*3600*1000);
+  const d1=new Date(p.t1 + tzOffsetHours*3600*1000);
+  const fmt=(d)=>d.toISOString().replace('T',' ').replace(/\.\d+Z$/,'').slice(0,19);
+  const vName = colorBySel.value;
+  tooltip.innerHTML = `<b>${vName}</b>: ${p.v}<br><b>freq</b>: ${p.f} MHz<br><b>start</b>: ${fmt(d0)}<br><b>end</b>: ${fmt(d1)}<br><b>duration</b>: ${p.dur.toFixed(1)} s`;
+  const pad=8; let tx=e.clientX+12, ty=e.clientY+12;
+  const tw=tooltip.offsetWidth||260, th=tooltip.offsetHeight||80;
+  if(tx+tw+pad>window.innerWidth) tx = window.innerWidth - tw - pad;
+  if(ty+th+pad>window.innerHeight) ty = window.innerHeight - th - pad;
+  tooltip.style.left=tx+'px'; tooltip.style.top=ty+'px'; tooltip.style.display='block';
+});
+canvas.addEventListener('click',(e)=>{
+  // On click, compute and render weekly table for clicked track's frequency
+  const rect=canvas.getBoundingClientRect();
+  const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+  let hit=null;
+  for(let i=LAST_RECTS.length-1;i>=0;i--){
+    const r=LAST_RECTS[i];
+    if(mx>=r.x0 && mx<=r.x1 && my>=r.y0 && my<=r.y1){ hit=r; break; }
+  }
+  if(hit){ buildWeeklyTableForFreq(hit.data.f); }
+});
+
+// Buttons & inputs
+boxZoomBtn.addEventListener('click',()=>{
+  boxZoomMode=!boxZoomMode;
+  boxZoomBtn.style.borderColor = boxZoomMode? '#60a5fa' : '#374151';
+});
+exportBtn.addEventListener('click',()=>{
+  const lg=document.getElementById('legend');
+  const tmp=document.createElement('canvas');
+  const w=canvas.width/canvas.getContext('2d').getTransform().a;
+  const h=canvas.height/canvas.getContext('2d').getTransform().d;
+  tmp.width = Math.floor(w + lg.clientWidth);
+  tmp.height= Math.floor(h);
+  const tctx=tmp.getContext('2d');
+  tctx.fillStyle='#0b0e13'; tctx.fillRect(0,0,tmp.width,tmp.height);
+  tctx.drawImage(canvas,0,0,w,h);
+  tctx.drawImage(lg, w, 0, lg.clientWidth, h);
+  const a=document.createElement('a');
+  a.download = 'waterfall.png';
+  a.href = tmp.toDataURL('image/png');
+  a.click();
+});
+[xStartSel,xEndSel,yFreqSel,colorBySel,cmapSel].forEach(sel=>{
+  sel.addEventListener('change',()=>{
+    startCol=xStartSel.value; endCol=xEndSel.value; freqCol=yFreqSel.value; valCol=colorBySel.value;
+    drawLegend(Number(vMinInput.value), Number(vMaxInput.value), cmapSel.value);
+    safe(prepare);
+  });
+});
+[binKhzInput, trackPxInput, strokePxInput, applyThr, thrInput, minDurInput].forEach(inp=>{
+  inp.addEventListener('change',()=>{ if(inp===binKhzInput) binKhzInput.dataset.locked="1"; draw(); });
+});
+tzInput.addEventListener('change',()=>{ tzOffsetHours=Number(tzInput.value)||0; draw(); if(LAST_FREQ_CLICKED!=null) buildWeeklyTableForFreq(LAST_FREQ_CLICKED); });
+autoScale.addEventListener('change',()=>{
+  if(autoScale.checked){
+    let vmin=Infinity,vmax=-Infinity;
+    for(const p of DATA){ if(p.v<vmin) vmin=p.v; if(p.v>vmax) vmax=p.v; }
+    if(isFinite(vmin)&&isFinite(vmax)){ vMinInput.value=vmin.toFixed(2); vMaxInput.value=vmax.toFixed(2); }
+  }
+  drawLegend(Number(vMinInput.value), Number(vMaxInput.value), cmapSel.value);
+  draw();
+});
+[vMinInput, vMaxInput].forEach(inp=> inp.addEventListener('change',()=>{ drawLegend(Number(vMinInput.value), Number(vMaxInput.value), cmapSel.value); draw(); }));
+
+resetBtn.addEventListener('click',()=>{ safe(prepare); hmWrap.innerHTML=''; hmTitle.textContent='Weekly activity heatmap (click a track above)'; hmLegend.textContent=''; LAST_FREQ_CLICKED=null; });
+
+// Load CSV
+async function tryLoadDefault(){
+  try{
+    const resp = await fetch('aggregated_signals.csv', {cache:'no-store'});
+    if(!resp.ok) throw new Error('not found');
+    const text = await resp.text();
+    loadFromText(text);
+    statusEl.textContent='Loaded aggregated_signals.csv from the same folder.';
+  }catch(err){
+    statusEl.textContent='Place this HTML with aggregated_signals.csv in the same folder, or click "Choose File".';
+  }
+}
+function loadFromText(text){
+  const parsed = parseCSV(text);
+  COLUMNS = parsed.columns; ROWS = parsed.data;
+  if(!COLUMNS.length || !ROWS.length){ statusEl.textContent='CSV seems empty.'; return; }
+  guessColumns();
+  tzOffsetHours = Number(tzInput.value)||0;
+  safe(prepare);
+}
+document.getElementById('fileInput').addEventListener('change', async (e)=>{
+  const f=e.target.files[0]; if(!f) return;
+  const text=await f.text(); loadFromText(text);
+  statusEl.textContent=`Loaded: ${f.name}`;
+});
+
+// Init
+drawLegend(Number(vMinInput.value), Number(vMaxInput.value), cmapSel.value);
+tryLoadDefault();
+</script>
+</body>
+</html>
