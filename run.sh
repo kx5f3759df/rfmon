@@ -28,9 +28,9 @@ CMD1=(
 
 # 第二个命令（核心循环命令；退出/完成后按 DELAYS 重试或重跑）
 CMD2=(
-  "python3 rfmon_v2.py --f-start 400 --f-stop 520 --samp 2 --dwell 1 --gain 20 --overlap 10 --auto-threshold 16"
+  "python3 rfmon.py --f-range 400,520 --samp 2 --dwell 0.5 --gain 20 --overlap 10 --auto-threshold 16 --dc-khz 1"
   "python3 -m http.server 8000 --directory report"
-  "nice -n 10 python3 aggr.py --dir ./ --out aggregated_signals.csv --link_time_max_min 30 --link_freq_base_mhz 0.0012 --link_freq_per_sec_mhz 0.0000002 --max_gap_min 10 --snap_to_canonical 1 --snap_tol_mhz 0.0015 --canon_use_first_n 5 --fuse_tol_mhz 0.0008 --round_freq 0.001 --stats_out stats.json && nice -n 10 python3 report.py --tz-offset 8 --f-start 439.5 --f-stop 450.5"
+  "nice -n 10 python3 aggr.py --dir ./ --out report/aggregated_signals.csv --link_time_max_min 30 --link_freq_base_mhz 0.0012 --link_freq_per_sec_mhz 0.0000002 --max_gap_min 10 --snap_to_canonical 1 --snap_tol_mhz 0.0015 --canon_use_first_n 5 --fuse_tol_mhz 0.0008 --round_freq 0.001 --stats_out stats.json"
 )
 
 # 第二个命令的重试/重跑延迟（秒）

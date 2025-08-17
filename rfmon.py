@@ -21,6 +21,38 @@ import random
 
 # --------------------------- Utils ---------------------------
 
+def measure_dc_width_hz(sdr, center_mhz, samp_hz, nfft=None, frames=12, margin_db=1.0):
+    """Return (width_hz, width_bins, bin_hz, noise_db) of DC spike at center_mhz."""
+    # auto-choose nfft so bin <=125 Hz
+    if nfft is None:
+        nfft = 1
+        while samp_hz/nfft > 125 and nfft < 65536: nfft *= 2
+    bin_hz = samp_hz / nfft
+    win = get_window("hann", nfft, fftbins=True).astype(np.float32)
+    win_pow = float((win**2).sum())
+    sdr.center_freq = center_mhz*1e6; time.sleep(0.02)
+
+    # avg spectrum
+    p_lin = 0
+    for _ in range(frames):
+        iq = sdr.read_samples(nfft).astype(np.complex64)
+        sp = np.fft.fftshift(np.fft.fft(iq*win, n=nfft))
+        p_lin += (np.abs(sp)**2)/(win_pow*nfft)
+    p_db = 10*np.log10(np.maximum(p_lin/frames,1e-20))
+
+    # noise and threshold
+    noise_db = float(np.median(p_db))
+    thr_db = noise_db + margin_db
+
+    # expand from center until below threshold
+    mid, k = nfft//2, 0
+    while k+1 < mid:
+        if p_db[mid-(k+1)]>=thr_db or p_db[mid+(k+1)]>=thr_db: k+=1
+        else: break
+
+    width_bins = 2*k+1
+    return width_bins*bin_hz, width_bins, bin_hz, noise_db
+
 def weighted_tail_sample(lst, n):
     length = len(lst)
     if n >= length:
@@ -169,7 +201,7 @@ def run(args):
     sdr.gain = args.gain if args.gain == "auto" else float(args.gain)
 
     # FFT params: choose nfft so that bin ~ 500 Hz (cap at 65536 for speed)
-    target_bin_hz = 500.0
+    target_bin_hz = 125.0
     nfft = 1
     while (samp_hz / nfft) > target_bin_hz:
         nfft *= 2
@@ -236,6 +268,25 @@ def run(args):
         if last_err:
             print(f"[!] tune failed @ {hz/1e6:.6f} MHz: {last_err}", file=sys.stderr)
         return False
+    
+
+    w_hz, w_bins, bin_hz, noise = measure_dc_width_hz(sdr, 52, samp_hz)
+    print(f"@52MHz DC width ≈ {w_hz/1e3:.1f} kHz ({w_bins} bins, {bin_hz:.1f} Hz/bin), noise {noise:.1f} dBFS")
+    w_hz, w_bins, bin_hz, noise = measure_dc_width_hz(sdr, 143, samp_hz)
+    print(f"@142MHz DC width ≈ {w_hz/1e3:.1f} kHz ({w_bins} bins, {bin_hz:.1f} Hz/bin), noise {noise:.1f} dBFS")
+    w_hz, w_bins, bin_hz, noise = measure_dc_width_hz(sdr, 435, samp_hz)
+    print(f"@435MHz DC width ≈ {w_hz/1e3:.1f} kHz ({w_bins} bins, {bin_hz:.1f} Hz/bin), noise {noise:.1f} dBFS")
+    w_hz, w_bins, bin_hz, noise = measure_dc_width_hz(sdr, 1200, samp_hz)
+    print(f"@1200MHz DC width ≈ {w_hz/1e3:.1f} kHz ({w_bins} bins, {bin_hz:.1f} Hz/bin), noise {noise:.1f} dBFS")
+
+
+    w_hz_arr = []
+    for i in range(200):
+        f = random.uniform(30, 1200) 
+        w_hz, w_bins, bin_hz, noise = measure_dc_width_hz(sdr, f, samp_hz)
+        w_hz_arr.append(w_hz)
+    w_hz = np.median(w_hz_arr)
+    print(f"DC width ≈ {w_hz/1e3:.1f} kHz")
 
     # Main scan loop
     # win_start_mhz = args.f_start
@@ -285,8 +336,8 @@ def run(args):
             
             # Add small random ±5 kHz dither to centers to avoid DC-bin suppression artifacts
             delta = 0
-            #delta = random.uniform(-(step_mhz / 2), (step_mhz / 2))
-            centers = list(map(lambda f: f + double_peak_sample(-0.005, 0.005) + delta, centers))
+            delta = random.uniform(-(step_mhz / 2), (step_mhz / 2))
+            #centers = list(map(lambda f: f + double_peak_sample(-0.005, 0.005) + delta, centers))
 
             random.shuffle(centers)
 
