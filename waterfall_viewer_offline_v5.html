@@ -15,7 +15,7 @@
   button { cursor:pointer; }
   #stage { display:grid; grid-template-columns: 1fr auto; column-gap:8px; align-items:stretch; }
   #canvas { width:100%; height:60vh; min-height:420px; display:block; background:#0b0e13; }
-  #legend { width:18px; height:60vh; min-height:420px; display:block; border-left:1px solid #1f2937; }
+  #legend { width:28px; height:60vh; min-height:420px; display:block; border-left:1px solid #1f2937; }
   #status { font-size:12px; color:#9ca3af; border-top:1px solid #1f2937; padding:6px 12px; min-height:20px; }
   .sep { width:1px; height:20px; background:#374151; margin:0 6px; }
   .hint { font-size:12px; color:#9ca3af; }
@@ -52,9 +52,9 @@
       </select>
     </label>
     <label>Freq bin (kHz): <input type="number" id="binKhz" value="12.5" step="0.5" /></label>
-    <label>Track thickness (px): <input type="number" id="trackPx" value="0" step="1" /></label>
-    <label>Stroke (px): <input type="number" id="strokePx" value="0" step="0.5" /></label>
-    <label>UTC offset (h): <input type="number" id="tzOffset" value="0" step="1" /></label>
+    <label>Track thickness (px): <input type="number" id="trackPx" value="4" step="1" /></label>
+    <label>Stroke (px): <input type="number" id="strokePx" value="1" step="0.5" /></label>
+    <label>UTC offset (h): <input type="number" id="tzOffset" value="8" step="1" /></label>
     <label><input type="checkbox" id="autoScale" checked> Auto color scale</label>
     <label>Min: <input type="number" id="vMin" step="0.1" value="-120"></label>
     <label>Max: <input type="number" id="vMax" step="0.1" value="-20"></label>
@@ -85,6 +85,10 @@
 </div>
 
 <script>
+
+const FREQ_MIN = 400;  // MHz
+const FREQ_MAX = 520;  // MHz
+
 window.addEventListener('error', (e)=>{
   const s=document.getElementById('status');
   s.textContent = 'Error: ' + (e.message || e.error);
@@ -179,7 +183,7 @@ function guessColumns(){
   const s = findName(["start_utc","start","begin","time"]);
   const e = findName(["end_utc","end","stop"]);
   const f = findName(["freq","mhz","khz","hz","center"]);
-  let v = findName(["duty_avg","duty","occup","util","power","pwr_avg","db","rssi"]);
+  let v = findName(["pwr_avg","power","duty_avg","duty","occup","util","db","rssi"]);
   startCol = s || COLUMNS[0];
   endCol   = e || COLUMNS[1] || startCol;
   freqCol  = f || COLUMNS[2] || COLUMNS[0];
@@ -209,6 +213,7 @@ function prepare(){
   for(let i=0;i<ROWS.length;i++){
     const s=S[i], e=E[i], f=F[i], v=V[i];
     if(s==null||e==null||f==null||v==null) continue;
+    if(f < FREQ_MIN || f > FREQ_MAX) continue;
     const t0=Math.min(s,e), t1=Math.max(s,e);
     const dur = (t1-t0)/1000;
     pts.push({t0,t1,f,v,dur,raw:ROWS[i]});
@@ -510,7 +515,15 @@ window.addEventListener('mousemove',(e)=>{
   const d1=new Date(p.t1 + tzOffsetHours*3600*1000);
   const fmt=(d)=>d.toISOString().replace('T',' ').replace(/\.\d+Z$/,'').slice(0,19);
   const vName = colorBySel.value;
-  tooltip.innerHTML = `<b>${vName}</b>: ${p.v}<br><b>freq</b>: ${p.f} MHz<br><b>start</b>: ${fmt(d0)}<br><b>end</b>: ${fmt(d1)}<br><b>duration</b>: ${p.dur.toFixed(1)} s`;
+  let rawFields = "";
+  for (const [key, val] of Object.entries(p.raw)) {
+    const lowerKey = key.toLowerCase();
+    if (!lowerKey.includes("start_utc") && !lowerKey.includes("end_utc")) {
+      rawFields += `<br><b>${key}</b>: ${val}`;
+    }
+  }
+  tooltip.innerHTML = `<b>start</b>: ${fmt(d0)}<br>` + `<b>end</b>: ${fmt(d1)}<br>` + `<b>Duration</b>: ${p.dur.toFixed(1)} s` + rawFields;
+  //tooltip.innerHTML = `<b>${vName}</b>: ${p.v}<br><b>freq</b>: ${p.f} MHz<br><b>start</b>: ${fmt(d0)}<br><b>end</b>: ${fmt(d1)}<br><b>duration</b>: ${p.dur.toFixed(1)} s`;
   const pad=8; let tx=e.clientX+12, ty=e.clientY+12;
   const tw=tooltip.offsetWidth||260, th=tooltip.offsetHeight||80;
   if(tx+tw+pad>window.innerWidth) tx = window.innerWidth - tw - pad;
