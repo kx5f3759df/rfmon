@@ -21,6 +21,17 @@ import random
 
 # --------------------------- Utils ---------------------------
 
+def parse_freq_range(s):
+    try:
+        start, stop = map(float, s.split(","))
+        if stop <= start:
+            raise ValueError
+        return [start, stop]
+    except:
+        raise argparse.ArgumentTypeError(
+            "Each --f-range must be in start,stop format with stop > start, e.g. 440,450"
+        )
+
 def aggregate_to_center(values, tolerance=0.5):
     if not values:
         return []
@@ -161,7 +172,8 @@ def run(args):
         step_mhz = args.samp
 
     print(f"[i] samp={args.samp:.3f} MHz, exact bin≈{bin_hz:.1f} Hz, nfft={nfft}, dwell={dwell_s:.2f}s")
-    print(f"[i] scan {args.f_start:.3f}–{args.f_stop:.3f} MHz, step≈{step_mhz:.3f} MHz (overlap={args.overlap}%)")
+    for r in args.f_range:
+        print(f"[i] scan {r[0]:.3f}–{r[1]:.3f} MHz, step≈{step_mhz:.3f} MHz (overlap={args.overlap}%)")
     print(f"[i] detect BW≈{args.nbw:.2f} kHz, merge_tol≈{merge_tol_hz/1e3:.1f} kHz, DC suppress={args.dc_suppress} (±{args.dc_khz:.1f} kHz)")
     if args.auto_threshold is not None:
         print(f"[i] threshold: noise +{args.auto_threshold:.1f} dB")
@@ -170,13 +182,14 @@ def run(args):
 
     # Generate center freq list
     centers_template = []
-    ws = args.f_start
-    while ws < args.f_stop:
-        we = min(args.f_stop, ws + args.samp)
-        if we <= ws:
-            break
-        centers_template.append(0.5 * (ws + we))
-        ws += step_mhz
+    for r in args.f_range:
+        ws = r[0]
+        while ws < r[1]:
+            we = min(r[1], ws + args.samp)
+            if we <= ws:
+                break
+            centers_template.append(0.5 * (ws + we))
+            ws += step_mhz
 
     # Signal handling
     stop_flag = False
@@ -382,8 +395,8 @@ def run(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Wideband NFM activity scanner/logger for RTL-SDR (dual duty outputs)")
-    p.add_argument("--f-start", type=float, default=440.0, help="Start frequency (MHz)")
-    p.add_argument("--f-stop",  type=float, default=450.0, help="Stop  frequency (MHz)")
+    #p.add_argument("--f-start", type=float, default=440.0, help="Start frequency (MHz)")
+    #p.add_argument("--f-stop",  type=float, default=450.0, help="Stop  frequency (MHz)")
     p.add_argument("--samp",    type=float, default=2.0,   help="Sample rate / span (MHz), e.g., 2.0~2.4")
     p.add_argument("--dwell",   type=float, default=5.0,     help="Dwell time per window (s)")
     p.add_argument("--gain",    default="20",              help="Gain dB (float) or 'auto' (default 20)")
@@ -400,10 +413,11 @@ def parse_args():
     p.add_argument("--dc-suppress", action="store_true", default=True, help="Suppress DC at center (default ON)")
     p.add_argument("--no-dc-suppress", dest="dc_suppress", action="store_false")
     p.add_argument("--dc-khz", type=float, default=2.0, help="DC suppression half-width (kHz), default 2")
+    p.add_argument("--f-range", action="append", type=parse_freq_range, required=True, help="Frequency range in MHz, e.g. --f-range 440,450 --f-range 470,490")
 
     args = p.parse_args()
-    if args.f_stop <= args.f_start:
-        print("[!] f-stop must be > f-start", file=sys.stderr); sys.exit(1)
+    #if args.f_stop <= args.f_start:
+    #    print("[!] f-stop must be > f-start", file=sys.stderr); sys.exit(1)
     if args.overlap < 0 or args.overlap >= 100:
         print("[!] overlap must be in [0, 99]", file=sys.stderr); sys.exit(1)
     return args
