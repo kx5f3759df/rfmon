@@ -21,6 +21,23 @@ import random
 
 # --------------------------- Utils ---------------------------
 
+def weighted_tail_sample(lst, n):
+    length = len(lst)
+    if n >= length:
+        return lst[:]
+
+    indices = list(range(length))
+    weights = list(range(1, length + 1))
+
+    chosen_idx = random.sample(indices, k=n, counts=weights)
+
+    return [lst[i] for i in chosen_idx]
+
+def format_time(elapsed: float) -> str:
+    minutes = int(elapsed // 60)
+    seconds = elapsed % 60
+    return f"{minutes}m{seconds:.3f}s"
+
 def parse_freq_range(s):
     try:
         start, stop = map(float, s.split(","))
@@ -32,23 +49,29 @@ def parse_freq_range(s):
             "Each --f-range must be in start,stop format with stop > start, e.g. 440,450"
         )
 
-def aggregate_to_center(values, tolerance=0.5):
+def aggregate_to_center(values, tolerance=0.75, keep_latest=None):
     if not values:
         return []
-    
-    values = sorted(values)
+
+    rev = values[::-1]
     groups = []
-    current_group = [values[0]]
+    cur = [rev[0]]
 
-    for val in values[1:]:
-        if abs(val - current_group[-1]) <= tolerance:
-            current_group.append(val)
+    for v in rev[1:]:
+        mid = (min(cur) + max(cur)) / 2
+        if abs(v - mid) <= tolerance:
+            cur.append(v)
         else:
-            groups.append(current_group)
-            current_group = [val]
-    groups.append(current_group)
+            groups.append(cur)
+            cur = [v]
+    groups.append(cur)
 
-    centers = [round(sum(group) / len(group), 3) for group in groups]
+    groups = groups[::-1]
+
+    centers = [round(sum(g) / len(g), 3) for g in groups]
+
+    if keep_latest is not None:
+        centers = centers[-keep_latest:]
     return centers
 
 def double_peak_sample(a=0.0, b=1.0, sigma=0.15, mix=0.5):
@@ -233,16 +256,41 @@ def run(args):
     centers = []
     hits = []
 
+    detailed_scan = False
+    detailed_scan_multiplier = 3.0
+    start_time = time.time()
+    hits_len = 0
+
     while not stop_flag:
         if not centers:
-            # wrap to start
-            centers = centers_template.copy() + aggregate_to_center(hits).copy()
+
+            hits_count = len(hits) - hits_len
+
+            hits = aggregate_to_center(hits)[-1000:].copy()
+            hits_len = len(hits)
+
+            end_time = time.time()
+            elapsed = end_time - start_time
+            print("Full scan" if detailed_scan else "Revisite scan" ,f"elapsed: {format_time(elapsed)}", "hits:", hits_count)
+            start_time = time.time()
+
+            if detailed_scan:
+                centers = weighted_tail_sample(hits, int(elapsed / (float(args.dwell) * detailed_scan_multiplier)))
+                print("Total revisiting centers:", len(centers))
+                dwell_s = float(args.dwell) * detailed_scan_multiplier
+            else:
+                centers = centers_template.copy()
+                print("Normal scan:", len(centers))
+                dwell_s = float(args.dwell)
+            
             # Add small random ±5 kHz dither to centers to avoid DC-bin suppression artifacts
-            centers = list(map(lambda f: f + double_peak_sample(-0.005, 0.005), centers))
+            delta = 0
+            #delta = random.uniform(-(step_mhz / 2), (step_mhz / 2))
+            centers = list(map(lambda f: f + double_peak_sample(-0.005, 0.005) + delta, centers))
 
             random.shuffle(centers)
 
-            hits = hits[-1000:]
+            #detailed_scan = not detailed_scan
 
         center_mhz = centers.pop(0)
         want_hz = center_mhz * 1e6
@@ -373,10 +421,10 @@ def run(args):
                     f"{duty_wide*100:.1f}",    # duty_wide (legacy)
                 ]
                 csv_w.writerow(row); csv_f.flush()
-                print(
-                    f"[HIT] {utc}  {center_mhz_out:.6f} MHz  {tr.max_db:.2f} dBFS  "
-                    f"duty={duty_center*100:.1f}%  duty_wide={duty_wide*100:.1f}%"
-                )
+                #print(
+                #    f"[HIT] {utc}  {center_mhz_out:.6f} MHz  {tr.max_db:.2f} dBFS  "
+                #    f"duty={duty_center*100:.1f}%  duty_wide={duty_wide*100:.1f}%"
+                #)
                 sys.stdout.flush()
 
         # Advance window
