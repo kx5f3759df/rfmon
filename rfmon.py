@@ -324,7 +324,7 @@ def run(args):
     hits = []
 
     detailed_scan = False
-    detailed_scan_multiplier = 3.0
+    detailed_scan_multiplier = 1.0
     start_time = time.time()
     hits_len = 0
 
@@ -349,14 +349,17 @@ def run(args):
             print("Full scan" if detailed_scan else "Revisite scan" ,f"elapsed: {format_time(elapsed)}", "hits:", hits_count)
             start_time = time.time()
 
+            centers = centers_template.copy()
+            dwell_s = float(args.dwell)
+
             if detailed_scan:
-                centers = weighted_tail_sample(hits, int(elapsed / (float(args.dwell) * detailed_scan_multiplier)))
-                print("Total revisiting centers:", len(centers))
+                centers_len = len(centers)
+                centers += weighted_tail_sample(hits, int(elapsed / (float(args.dwell) * detailed_scan_multiplier)))
+                print("Normal scan", centers_len, "with revisiting centers", len(centers) - centers_len, "/", len(hits))
                 dwell_s = float(args.dwell) * detailed_scan_multiplier
             else:
-                centers = centers_template.copy()
-                print("Normal scan:", len(centers))
-                dwell_s = float(args.dwell)
+                print("Normal scan", len(centers))
+
             
             # Add small random ±5 kHz dither to centers to avoid DC-bin suppression artifacts
             delta = 0
@@ -365,7 +368,7 @@ def run(args):
 
             random.shuffle(centers)
 
-            #detailed_scan = not detailed_scan
+            detailed_scan = not detailed_scan
 
         center_mhz = centers.pop(0)
         want_hz = center_mhz * 1e6
