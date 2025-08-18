@@ -13,7 +13,7 @@ Based on your original band_sentry.py with minimal, additive changes:
 Deps: pyrtlsdr, numpy, scipy
 """
 
-import argparse, math, time, sys, csv, signal, datetime, os
+import argparse, math, time, sys, gzip, csv, signal, datetime, os
 import numpy as np
 from rtlsdr import RtlSdr
 from scipy.signal import get_window
@@ -23,10 +23,10 @@ import random
 
 def measure_dc_width_hz(sdr, center_mhz, samp_hz, nfft=None, frames=12, margin_db=1.0):
     """Return (width_hz, width_bins, bin_hz, noise_db) of DC spike at center_mhz."""
-    # auto-choose nfft so bin <=125 Hz
+    # auto-choose nfft so bin <=500 Hz
     if nfft is None:
         nfft = 1
-        while samp_hz/nfft > 125 and nfft < 65536: nfft *= 2
+        while samp_hz/nfft > 500 and nfft < 65536: nfft *= 2
     bin_hz = samp_hz / nfft
     win = get_window("hann", nfft, fftbins=True).astype(np.float32)
     win_pow = float((win**2).sum())
@@ -183,7 +183,12 @@ def run(args):
     if csv_f.tell() == 0:
         # Columns: original + duty (single-bin) + duty_wide (legacy)
         csv_w.writerow(["utc_iso", "center_mhz", "p_dbfs", "duty", "duty_wide"])
-    print(f"[i] CSV -> {csv_name}")
+    print(f"[scan] CSV -> {csv_name}")
+
+    ftt_csv_name = f"ftt_{start_iso.replace(':','-')}.csv.gz"
+    ftt_csv_f = gzip.open(ftt_csv_name, "at", newline="", encoding="utf-8", compresslevel=5)
+    ftt_csv_w = csv.writer(ftt_csv_f)
+    print(f"[ftt] CSV -> {csv_name}")
 
     # RTL-SDR setup (no 0 Hz tuning!)
     sdr = RtlSdr()
@@ -201,7 +206,7 @@ def run(args):
     sdr.gain = args.gain if args.gain == "auto" else float(args.gain)
 
     # FFT params: choose nfft so that bin ~ 500 Hz (cap at 65536 for speed)
-    target_bin_hz = 125.0
+    target_bin_hz = 500.0
     nfft = 1
     while (samp_hz / nfft) > target_bin_hz:
         nfft *= 2
@@ -237,6 +242,7 @@ def run(args):
 
     # Generate center freq list
     centers_template = []
+    spectrum_dict = {}
     for r in args.f_range:
         ws = r[0]
         while ws < r[1]:
@@ -245,6 +251,16 @@ def run(args):
                 break
             centers_template.append(0.5 * (ws + we))
             ws += step_mhz
+
+        start_khz = int(round((r[0] - args.samp) * 1000))
+        stop_khz  = int(round((r[1] + args.samp) * 1000))
+        for khz in range(start_khz, stop_khz + 1):  # 步长1kHz
+            key = f"{khz/1000.0:.3f}"
+            spectrum_dict[key] = -120.0
+
+    keys_sorted = sorted(spectrum_dict.keys(), key=lambda k: float(k))
+    if ftt_csv_f.tell() == 0:
+        ftt_csv_w.writerow(["utc"] + keys_sorted)
 
     # Signal handling
     stop_flag = False
@@ -281,7 +297,7 @@ def run(args):
 
 
     w_hz_arr = []
-    for i in range(200):
+    for i in range(20):
         f = random.uniform(30, 1200) 
         w_hz, w_bins, bin_hz, noise = measure_dc_width_hz(sdr, f, samp_hz)
         w_hz_arr.append(w_hz)
@@ -312,8 +328,16 @@ def run(args):
     start_time = time.time()
     hits_len = 0
 
+    utc_str = iso_utc()
+
     while not stop_flag:
         if not centers:
+            
+            #values_sorted = [val for k, val in sorted(spectrum_dict.items(), key=lambda kv: float(kv[0]))]
+            values_sorted = [f"{spectrum_dict[k]:.1f}" for k in keys_sorted]
+            ftt_csv_w.writerow([utc_str] + values_sorted)
+            ftt_csv_f.flush()
+            utc_str = iso_utc()
 
             hits_count = len(hits) - hits_len
 
@@ -366,6 +390,16 @@ def run(args):
                 lo = max(0, mid - dc_bins_exclude)
                 hi = min(nfft, mid + dc_bins_exclude + 1)
                 p_db[lo:hi] = -300.0
+
+            # Snapshot
+            freq_axis_hz = want_hz + (np.arange(nfft) - (nfft // 2)) * bin_hz
+            for f, db in zip(freq_axis_hz, p_db):
+                key = f"{f/1e6:.3f}"
+                val = float(db)
+                if key in spectrum_dict:
+                    spectrum_dict[key] = max(spectrum_dict[key], val)
+                else:
+                    spectrum_dict[key] = val
 
             # Threshold
             if args.auto_threshold is not None:
