@@ -330,6 +330,8 @@ def run(args):
 
     utc_str = iso_utc()
 
+    fft_done = set()
+
     while not stop_flag:
         if not centers:
             
@@ -338,6 +340,7 @@ def run(args):
             ftt_csv_w.writerow([utc_str] + values_sorted)
             ftt_csv_f.flush()
             utc_str = iso_utc()
+            fft_done = set()
 
             hits_count = len(hits) - hits_len
 
@@ -399,10 +402,12 @@ def run(args):
             for f, db in zip(freq_axis_hz, p_db):
                 key = f"{f/1e6:.3f}"
                 val = float(db)
-                if key in spectrum_dict:
+                
+                if key in spectrum_dict and key in fft_done:
                     spectrum_dict[key] = max(spectrum_dict[key], val)
                 else:
                     spectrum_dict[key] = val
+                    fft_done.add(key)
 
             # Threshold
             if args.auto_threshold is not None:
